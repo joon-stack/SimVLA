@@ -46,6 +46,11 @@ class SmolVLMVLAConfig(PretrainedConfig):
         
         # === DiT/AdaLN Mode ===
         use_adaln: bool = False,
+
+        # === Latent auxiliary head ===
+        latent_aux_enabled: bool = False,
+        latent_num_tokens: int = 4,
+        latent_token_dim: int = 32,
         
         # === Image settings ===
         image_size: int = 384,  # Can be 384 or 512
@@ -71,6 +76,11 @@ class SmolVLMVLAConfig(PretrainedConfig):
         
         # DiT/AdaLN settings
         self.use_adaln = use_adaln
+
+        # Latent auxiliary settings
+        self.latent_aux_enabled = latent_aux_enabled
+        self.latent_num_tokens = latent_num_tokens
+        self.latent_token_dim = latent_token_dim
         
         # Image settings
         self.image_size = image_size

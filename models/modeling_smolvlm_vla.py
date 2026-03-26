@@ -28,6 +28,7 @@ import cv2
 
 from transformers import PreTrainedModel, AutoProcessor, AutoModelForImageTextToText
 from .transformer_smolvlm import SmolVLMActionTransformer
+from .latent_aux_head import LatentAuxHead
 from .action_hub import build_action_space
 from .configuration_smolvlm_vla import SmolVLMVLAConfig
 
@@ -85,7 +86,23 @@ class SmolVLMVLA(PreTrainedModel):
 
         # DiT/AdaLN mode setting
         self.use_adaln = getattr(config, 'use_adaln', False)
-        
+
+        # Latent auxiliary settings
+        self.latent_aux_enabled: bool = bool(getattr(config, 'latent_aux_enabled', False))
+        self.latent_num_tokens: int = int(getattr(config, 'latent_num_tokens', 4))
+        self.latent_token_dim: int = int(getattr(config, 'latent_token_dim', 32))
+        self.latent_head: LatentAuxHead | None = None
+        if self.latent_aux_enabled:
+            self.latent_head = LatentAuxHead(
+                hidden_size=config.hidden_size,
+                num_tokens=self.latent_num_tokens,
+                token_dim=self.latent_token_dim,
+            )
+            logging.info(
+                "✓ Latent auxiliary head enabled: "
+                f"num_tokens={self.latent_num_tokens}, token_dim={self.latent_token_dim}"
+            )
+
         # Flow matching action head (SmolVLM version - no aux_visual)
         self.transformer = SmolVLMActionTransformer(
             hidden_size=config.hidden_size,
@@ -329,6 +346,7 @@ class SmolVLMVLA(PreTrainedModel):
         image_mask: torch.Tensor,           # [B, V]
         proprio: torch.Tensor,              # [B, dim_proprio]
         action: torch.Tensor,               # [B, T=num_actions, D=dim_action]
+        latent_target_tokens: torch.Tensor | None = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Flow Matching training.
@@ -372,17 +390,51 @@ class SmolVLMVLA(PreTrainedModel):
         u_t = noise - action_norm
 
         # Model prediction (no aux_visual_inputs for SmolVLM)
-        v_t = self.transformer(
+        v_t, policy_hidden = self.transformer.forward_with_features(
             vlm_features=enc["vlm_features"],
             action_with_noise=x_t,
             t=t,
             proprio=proprio_norm,
         )
-        
+
         # MSE loss
         velocity_loss = torch.mean(torch.square(v_t - u_t))
-        
-        return {"velocity_loss": velocity_loss}
+
+        losses: Dict[str, torch.Tensor] = {"velocity_loss": velocity_loss}
+
+        if self.latent_aux_enabled and latent_target_tokens is not None:
+            if self.latent_head is None:
+                raise RuntimeError("latent_aux_enabled is set but latent_head is not initialized.")
+            if latent_target_tokens.ndim != 3:
+                raise ValueError(
+                    "latent_target_tokens must have shape [B, Q, Dz], got "
+                    f"{tuple(latent_target_tokens.shape)}."
+                )
+            if latent_target_tokens.shape[0] != policy_hidden.shape[0]:
+                raise ValueError(
+                    "latent_target_tokens batch size mismatch: expected "
+                    f"{policy_hidden.shape[0]}, got {latent_target_tokens.shape[0]}."
+                )
+            if latent_target_tokens.shape[1] != self.latent_num_tokens:
+                raise ValueError(
+                    "latent_target_tokens token count mismatch: expected "
+                    f"{self.latent_num_tokens}, got {latent_target_tokens.shape[1]}."
+                )
+            if latent_target_tokens.shape[2] != self.latent_token_dim:
+                raise ValueError(
+                    "latent_target_tokens feature size mismatch: expected "
+                    f"{self.latent_token_dim}, got {latent_target_tokens.shape[2]}."
+                )
+
+            latent_pred = self.latent_head(policy_hidden)
+            latent_target_tokens = latent_target_tokens.to(
+                device=latent_pred.device,
+                dtype=latent_pred.dtype,
+            )
+            latent_aux_loss = torch.mean(torch.square(latent_pred - latent_target_tokens))
+            losses["latent_aux_loss"] = latent_aux_loss
+
+        return losses
 
     # ================================= inference =================================
     @torch.no_grad()
