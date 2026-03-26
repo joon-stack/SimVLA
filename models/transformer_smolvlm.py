@@ -353,10 +353,34 @@ class SmolVLMActionTransformer(nn.Module):
         -------
         Tensor: Predicted velocity, [B, T_action, dim_action]
         """
+        velocity, _ = self.forward_with_features(
+            vlm_features=vlm_features,
+            action_with_noise=action_with_noise,
+            proprio=proprio,
+            t=t,
+        )
+        return velocity
+
+    def forward_with_features(
+        self,
+        vlm_features: torch.Tensor,
+        action_with_noise: torch.Tensor,
+        proprio: torch.Tensor,
+        t: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass that returns both the predicted velocity and the shared
+        policy hidden used immediately before the final action projection.
+
+        Returns
+        -------
+        tuple[Tensor, Tensor]
+            velocity: [B, T_action, dim_action]
+            policy_hidden: [B, T_action, hidden_size]
+        """
         if self.use_adaln:
             return self._forward_adaln(vlm_features, action_with_noise, proprio, t)
-        else:
-            return self._forward_concat(vlm_features, action_with_noise, proprio, t)
+        return self._forward_concat(vlm_features, action_with_noise, proprio, t)
     
     def _forward_concat(
         self,
@@ -364,7 +388,7 @@ class SmolVLMActionTransformer(nn.Module):
         action_with_noise: torch.Tensor,
         proprio: torch.Tensor,
         t: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Concat mode forward pass.
         
@@ -396,8 +420,10 @@ class SmolVLMActionTransformer(nn.Module):
         for block in self.blocks:
             x = block(x)
 
-        # Decode only the action segment
-        return self.action_decoder(self.norm(x[:, :num_actions]))
+        # Decode only the action segment.
+        policy_hidden = self.norm(x[:, :num_actions])
+        velocity = self.action_decoder(policy_hidden)
+        return velocity, policy_hidden
     
     def _forward_adaln(
         self,
@@ -405,7 +431,7 @@ class SmolVLMActionTransformer(nn.Module):
         action_with_noise: torch.Tensor,
         proprio: torch.Tensor,
         t: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         DiT/AdaLN mode forward pass.
         
@@ -439,7 +465,9 @@ class SmolVLMActionTransformer(nn.Module):
             x = block(x, c)
         
         # ========== 4. Final Layer with AdaLN ==========
-        return self.final_layer(x, c)
+        policy_hidden = x
+        velocity = self.final_layer(policy_hidden, c)
+        return velocity, policy_hidden
 
 
 __all__ = [
