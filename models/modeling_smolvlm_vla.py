@@ -71,6 +71,7 @@ class SmolVLMVLA(PreTrainedModel):
             config.smolvlm_model_path,
             torch_dtype=torch.float32,  # Use float32 for training stability
             trust_remote_code=True,
+            attn_implementation="flash_attention_2",
         )
         self.vlm_processor = AutoProcessor.from_pretrained(
             config.smolvlm_model_path,
