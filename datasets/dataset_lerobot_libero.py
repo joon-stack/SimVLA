@@ -156,6 +156,8 @@ class LeRobotLiberoDataReader(IterableDataset):
         image_size: int = 384,
         camera_mode: str = "single",
         task_suite_name: str | None = None,
+        emit_latent_teacher_fields: bool = False,
+        latent_teacher_future_offset: int | None = None,
     ):
         if ds is None or pq is None:
             raise ImportError(
@@ -176,6 +178,15 @@ class LeRobotLiberoDataReader(IterableDataset):
             raise ValueError(
                 f"camera_mode must be 'single' or 'dual', got {self.camera_mode!r}."
             )
+        self.emit_latent_teacher_fields = bool(emit_latent_teacher_fields)
+        if latent_teacher_future_offset is None:
+            latent_teacher_future_offset = self.num_actions
+        self.latent_teacher_future_offset = int(latent_teacher_future_offset)
+        if self.latent_teacher_future_offset < 1:
+            raise ValueError(
+                "latent_teacher_future_offset must be positive, got "
+                f"{self.latent_teacher_future_offset}."
+            )
         self.task_suite_name = normalize_libero_task_suite_name(task_suite_name)
         self.task_indices = resolve_libero_task_indices(task_suite_name)
         self.image_keys = ["observation.images.image"]
@@ -183,6 +194,7 @@ class LeRobotLiberoDataReader(IterableDataset):
             self.image_keys.append("observation.images.image2")
 
         self.image_aug = self._build_image_transforms(training=self.training)
+        self.latent_teacher_image_transform = self._build_teacher_image_transforms()
         self._arrow_dataset_cache: dict[str, ds.Dataset] = {}
         self._arrow_dataset_cache_pid = os.getpid()
 
@@ -221,6 +233,18 @@ class LeRobotLiberoDataReader(IterableDataset):
             transforms.Normalize(self.IMAGE_MEAN, self.IMAGE_STD, inplace=True),
         ])
         return transforms.Compose(transform_list)
+
+    def _build_teacher_image_transforms(self) -> transforms.Compose:
+        return transforms.Compose(
+            [
+                transforms.Resize(
+                    (self.image_size, self.image_size),
+                    interpolation=InterpolationMode.BICUBIC,
+                    antialias=True,
+                ),
+                transforms.ToTensor(),
+            ]
+        )
 
     @staticmethod
     def _extract_singleton_int(value) -> int | None:
@@ -387,6 +411,23 @@ class LeRobotLiberoDataReader(IterableDataset):
         image_input = torch.stack(images[: self.num_views], dim=0)
         return image_input, image_mask
 
+    def _build_teacher_image_tensor(self, row: dict) -> torch.Tensor | None:
+        image = self._decode_image(row.get(self.image_keys[0], None))
+        if image is None:
+            return None
+        return self.latent_teacher_image_transform(image)
+
+    def _build_latent_teacher_image_pair(
+        self, rows: list[dict], start_idx: int
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        last_valid_index = len(rows) - 1
+        future_idx = min(start_idx + self.latent_teacher_future_offset, last_valid_index)
+        latent_obs_image = self._build_teacher_image_tensor(rows[start_idx])
+        latent_future_obs_image = self._build_teacher_image_tensor(rows[future_idx])
+        if latent_obs_image is None or latent_future_obs_image is None:
+            return None
+        return latent_obs_image, latent_future_obs_image
+
     def _build_future_action_chunk(self, rows: list[dict], start_idx: int) -> torch.Tensor:
         last_valid_index = len(rows) - 1
         action_dim = len(rows[0]["action"])
@@ -411,13 +452,25 @@ class LeRobotLiberoDataReader(IterableDataset):
             image_input, image_mask = image_data
             proprio = torch.tensor(rows[idx]["observation.state"], dtype=torch.float32)
             action = self._build_future_action_chunk(rows, idx)
-            yield {
+            sample = {
                 "language_instruction": episode.task_name,
                 "image_input": image_input,
                 "image_mask": image_mask,
                 "proprio": proprio,
                 "action": action,
             }
+            if self.emit_latent_teacher_fields:
+                teacher_pair = self._build_latent_teacher_image_pair(rows, idx)
+                if teacher_pair is None:
+                    continue
+                latent_obs_image, latent_future_obs_image = teacher_pair
+                sample["latent_obs_image"] = latent_obs_image
+                sample["latent_future_obs_image"] = latent_future_obs_image
+                sample["latent_teacher_future_offset"] = torch.tensor(
+                    self.latent_teacher_future_offset,
+                    dtype=torch.long,
+                )
+            yield sample
 
     def __iter__(self):
         worker_info = get_worker_info()
@@ -449,6 +502,8 @@ def create_lerobot_libero_dataloader(
     image_size: int = 384,
     camera_mode: str = "single",
     task_suite_name: str | None = None,
+    emit_latent_teacher_fields: bool = False,
+    latent_teacher_future_offset: int | None = None,
 ):
     def worker_init_fn(worker_id: int):
         base_seed = torch.initial_seed() % (2**32)
@@ -474,6 +529,8 @@ def create_lerobot_libero_dataloader(
         image_size=image_size,
         camera_mode=camera_mode,
         task_suite_name=task_suite_name,
+        emit_latent_teacher_fields=emit_latent_teacher_fields,
+        latent_teacher_future_offset=latent_teacher_future_offset,
     )
     return DataLoader(
         dataset,
