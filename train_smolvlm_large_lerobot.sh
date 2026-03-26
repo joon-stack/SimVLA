@@ -3,12 +3,13 @@
 
 set -e
 
-BATCH_SIZE=${1:-256}
+BATCH_SIZE=${1:-128}
 LEARNING_COEF=${2:-0.1}
 OUTPUT_DIR=${3:-./runs/simvla_libero_large_lerobot}
 RESUME_CKPT=${4:-""}
 TASK_SUITE_NAME=${5:-""}
 CAMERA_MODE=${6:-dual}
+GRAD_ACCUM_STEPS=${7:-2}
 
 echo "Training parameters:"
 echo "   batch_size: $BATCH_SIZE"
@@ -17,11 +18,13 @@ echo "   output_dir: $OUTPUT_DIR"
 echo "   resume_ckpt: ${RESUME_CKPT:-'None (training from scratch)'}"
 echo "   task_suite_name: ${TASK_SUITE_NAME:-'all'}"
 echo "   camera_mode: ${CAMERA_MODE}"
+echo "   grad_accum_steps: ${GRAD_ACCUM_STEPS}"
 
 GPU_DEVICES=${SIMVLA_CUDA_VISIBLE_DEVICES:-0}
 NUM_PROCESSES=${SIMVLA_NUM_PROCESSES:-1}
 MAIN_PROCESS_PORT=${SIMVLA_MAIN_PROCESS_PORT:-29505}
 MIXED_PRECISION=${SIMVLA_MIXED_PRECISION:-bf16}
+EFFECTIVE_GLOBAL_BATCH_SIZE=$((BATCH_SIZE * GRAD_ACCUM_STEPS * NUM_PROCESSES))
 
 export CUDA_VISIBLE_DEVICES=${GPU_DEVICES}
 export TF_CPP_MIN_LOG_LEVEL=2
@@ -52,6 +55,7 @@ ARGS="--output_dir ${OUTPUT_DIR} \
     --smolvlm_model_path ${SMOLVLM_MODEL} \
     --action_mode libero_joint \
     --batch_size ${BATCH_SIZE} \
+    --gradient_accumulation_steps ${GRAD_ACCUM_STEPS} \
     --learning_rate ${LEARNING_RATE} \
     --learning_coef ${LEARNING_COEF} \
     --num_actions ${NUM_ACTIONS} \
@@ -93,6 +97,8 @@ echo "Task suite: ${TASK_SUITE_NAME:-'all'}"
 echo "Camera mode: ${CAMERA_MODE}"
 echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
 echo "num_processes: ${NUM_PROCESSES}"
+echo "grad_accumulation_steps: ${GRAD_ACCUM_STEPS}"
+echo "effective_global_batch_size: ${EFFECTIVE_GLOBAL_BATCH_SIZE}"
 echo "mixed_precision: ${MIXED_PRECISION}"
 echo "============================================================"
 

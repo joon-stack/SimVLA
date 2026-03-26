@@ -113,6 +113,8 @@ def get_args_parser():
     parser.add_argument("--local_files_only", action="store_true", default=False,
                         help="Use local Hugging Face cache only when resolving lerobot_hf snapshots")
     parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
+                        help="Number of micro-batches to accumulate before each optimizer step")
     parser.add_argument("--image_size", type=int, default=384, 
                         help="Image size for SmolVLM (default: 384, can be 384 or 512)")
 
@@ -278,13 +280,19 @@ def main(args):
     accelerator = Accelerator(
         log_with=log_with,
         project_dir=output_dir,
-        kwargs_handlers=[ddp_kwargs]
+        kwargs_handlers=[ddp_kwargs],
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
     )
 
     # Initialize trackers
     tracker_config = {
         "learning_rate": args.learning_rate,
         "batch_size": args.batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "micro_batch_size": args.batch_size,
+        "effective_global_batch_size": (
+            args.batch_size * args.gradient_accumulation_steps * accelerator.num_processes
+        ),
         "iters": args.iters,
         "dataset_backend": args.dataset_backend,
         "dataset_repo_id": args.dataset_repo_id,
@@ -443,29 +451,40 @@ def main(args):
                 pass
     
     global_step, t0 = start_step, time.time()
+    effective_global_batch_size = (
+        args.batch_size * args.gradient_accumulation_steps * accelerator.num_processes
+    )
     logger.info(f"🚀 Start SmolVLM-VLA training for {args.iters} iterations")
     logger.info(f"   world_size={accelerator.num_processes}")
+    logger.info(f"   micro_batch_size={args.batch_size}")
+    logger.info(f"   grad_accumulation={args.gradient_accumulation_steps}")
+    logger.info(f"   effective_global_batch_size={effective_global_batch_size}")
 
+    optim.zero_grad()
     for batch in train_dataloader:
         # Encode language
         lang = processor.encode_language(batch["language_instruction"])
         batch.pop("language_instruction", None)
         inputs = {**batch, **lang}
         inputs = {k: v.cuda(non_blocking=True) for k, v in inputs.items()}
-        
-        # Update LR
-        update_group_lrs(optim, global_step, args)
 
-        # Forward
-        loss_dict: Dict[str, torch.Tensor] = model(**inputs)
-        loss = sum(loss_dict.values())
-        
-        # Backward
-        accelerator.backward(loss)
-        if args.max_grad_norm:
-            accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-        optim.step()
-        optim.zero_grad()
+        with accelerator.accumulate(model):
+            # Update LR in optimizer-step units.
+            update_group_lrs(optim, global_step, args)
+
+            # Forward
+            loss_dict: Dict[str, torch.Tensor] = model(**inputs)
+            loss = sum(loss_dict.values())
+
+            # Backward / optimize
+            accelerator.backward(loss)
+            if accelerator.sync_gradients and args.max_grad_norm:
+                accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+            optim.step()
+            optim.zero_grad()
+
+        if not accelerator.sync_gradients:
+            continue
 
         # Logging
         if global_step % args.log_interval == 0:
@@ -484,7 +503,7 @@ def main(args):
                     f"lr_action={logs['lr_action_heads']:.2e} "
                     f"lr_vlm={logs['lr_vlm']:.2e} ({dt:.2f}s/it)"
                 )
-        
+
         # Checkpointing
         global_step += 1
         if accelerator.is_main_process:
@@ -494,7 +513,7 @@ def main(args):
                 accelerator.unwrap_model(model).save_pretrained(save_dir, safe_serialization=True)
                 with open(os.path.join(save_dir, "state.json"), "w") as f:
                     json.dump({"global_step": global_step}, f)
-                    
+
         if global_step >= args.iters:
             break
 
