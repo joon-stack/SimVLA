@@ -11,6 +11,12 @@ TASK_SUITE_NAME=${5:-""}
 CAMERA_MODE=${6:-dual}
 GRAD_ACCUM_STEPS=${7:-2}
 
+LATENT_AUX_ENABLED=${SIMVLA_LATENT_AUX_ENABLED:-false}
+LATENT_AUX_WEIGHT=${SIMVLA_LATENT_AUX_WEIGHT:-1.0}
+LATENT_TEACHER_REPO_ROOT=${SIMVLA_LATENT_TEACHER_REPO_ROOT:-""}
+LATENT_TEACHER_CONFIG=${SIMVLA_LATENT_TEACHER_CONFIG:-""}
+LATENT_TEACHER_CHECKPOINT=${SIMVLA_LATENT_TEACHER_CHECKPOINT:-""}
+LATENT_TEACHER_FUTURE_OFFSET=${SIMVLA_LATENT_TEACHER_FUTURE_OFFSET:-""}
 echo "Training parameters:"
 echo "   batch_size: $BATCH_SIZE"
 echo "   learning_coef: $LEARNING_COEF"
@@ -83,6 +89,16 @@ if [ "${USE_ADALN}" = true ]; then
     ARGS="${ARGS} --use_adaln"
 fi
 
+if [ "${LATENT_AUX_ENABLED}" = true ]; then
+    ARGS="${ARGS} --latent_aux_enabled --latent_aux_weight ${LATENT_AUX_WEIGHT}"
+    ARGS="${ARGS} --latent_teacher_repo_root ${LATENT_TEACHER_REPO_ROOT}"
+    ARGS="${ARGS} --latent_teacher_config ${LATENT_TEACHER_CONFIG}"
+    ARGS="${ARGS} --latent_teacher_checkpoint ${LATENT_TEACHER_CHECKPOINT}"
+    if [ -n "${LATENT_TEACHER_FUTURE_OFFSET}" ]; then
+        ARGS="${ARGS} --latent_teacher_future_offset ${LATENT_TEACHER_FUTURE_OFFSET}"
+    fi
+fi
+
 if [ -n "${RESUME_CKPT}" ]; then
     ARGS="${ARGS} --models ${RESUME_CKPT} --resume"
     echo "Resuming from ${RESUME_CKPT}"
@@ -100,6 +116,13 @@ echo "num_processes: ${NUM_PROCESSES}"
 echo "grad_accumulation_steps: ${GRAD_ACCUM_STEPS}"
 echo "effective_global_batch_size: ${EFFECTIVE_GLOBAL_BATCH_SIZE}"
 echo "mixed_precision: ${MIXED_PRECISION}"
+if [ "${LATENT_AUX_ENABLED}" = true ]; then
+    echo "latent_aux_enabled: true"
+    echo "latent_aux_weight: ${LATENT_AUX_WEIGHT}"
+    echo "latent_teacher_repo_root: ${LATENT_TEACHER_REPO_ROOT}"
+    echo "latent_teacher_config: ${LATENT_TEACHER_CONFIG}"
+    echo "latent_teacher_checkpoint: ${LATENT_TEACHER_CHECKPOINT}"
+fi
 echo "============================================================"
 
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
