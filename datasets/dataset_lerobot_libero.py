@@ -158,6 +158,7 @@ class LeRobotLiberoDataReader(IterableDataset):
         task_suite_name: str | None = None,
         emit_latent_teacher_fields: bool = False,
         latent_teacher_future_offset: int | None = None,
+        latent_teacher_image_size: int = 224,
     ):
         if ds is None or pq is None:
             raise ImportError(
@@ -186,6 +187,12 @@ class LeRobotLiberoDataReader(IterableDataset):
             raise ValueError(
                 "latent_teacher_future_offset must be positive, got "
                 f"{self.latent_teacher_future_offset}."
+            )
+        self.latent_teacher_image_size = int(latent_teacher_image_size)
+        if self.latent_teacher_image_size <= 0:
+            raise ValueError(
+                "latent_teacher_image_size must be positive, got "
+                f"{self.latent_teacher_image_size}."
             )
         self.task_suite_name = normalize_libero_task_suite_name(task_suite_name)
         self.task_indices = resolve_libero_task_indices(task_suite_name)
@@ -238,7 +245,7 @@ class LeRobotLiberoDataReader(IterableDataset):
         return transforms.Compose(
             [
                 transforms.Resize(
-                    (self.image_size, self.image_size),
+                    (self.latent_teacher_image_size, self.latent_teacher_image_size),
                     interpolation=InterpolationMode.BICUBIC,
                     antialias=True,
                 ),
@@ -504,6 +511,7 @@ def create_lerobot_libero_dataloader(
     task_suite_name: str | None = None,
     emit_latent_teacher_fields: bool = False,
     latent_teacher_future_offset: int | None = None,
+    latent_teacher_image_size: int = 224,
 ):
     def worker_init_fn(worker_id: int):
         base_seed = torch.initial_seed() % (2**32)
@@ -531,6 +539,7 @@ def create_lerobot_libero_dataloader(
         task_suite_name=task_suite_name,
         emit_latent_teacher_fields=emit_latent_teacher_fields,
         latent_teacher_future_offset=latent_teacher_future_offset,
+        latent_teacher_image_size=latent_teacher_image_size,
     )
     return DataLoader(
         dataset,
