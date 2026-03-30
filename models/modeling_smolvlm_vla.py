@@ -33,6 +33,16 @@ from .action_hub import build_action_space
 from .configuration_smolvlm_vla import SmolVLMVLAConfig
 
 
+def _module_float_dtype(module: torch.nn.Module) -> torch.dtype:
+    for tensor in module.parameters():
+        if tensor.is_floating_point():
+            return tensor.dtype
+    for tensor in module.buffers():
+        if tensor.is_floating_point():
+            return tensor.dtype
+    raise RuntimeError(f"Module {module.__class__.__name__} has no floating-point tensors.")
+
+
 class SmolVLMVLA(PreTrainedModel):
     """
     SmolVLM-VLA: HuggingFace-compatible Vision-Language-Action policy.
@@ -251,7 +261,10 @@ class SmolVLMVLA(PreTrainedModel):
                 pixel_values = pixel_values[:, :, 0]
         B, V, C, H, W = pixel_values.shape
         device = pixel_values.device
-        dtype = pixel_values.dtype
+        vision_model = self.vlm.model.vision_model
+        text_model = self.vlm.model.text_model
+        vision_dtype = _module_float_dtype(vision_model)
+        text_dtype = _module_float_dtype(text_model)
         
         # ========== Step 1: Get vision features ==========
         # Flatten images: [B, V, C, H, W] -> [B*V, C, H, W]
@@ -263,9 +276,10 @@ class SmolVLMVLA(PreTrainedModel):
         
         if valid_images.shape[0] == 0:
             raise ValueError("At least one image view must be valid.")
+        valid_images = valid_images.to(dtype=vision_dtype)
         
         # Encode images through SmolVLM's vision encoder (SigLIP)
-        vision_outputs = self.vlm.model.vision_model(
+        vision_outputs = vision_model(
             pixel_values=valid_images,
             output_hidden_states=True,
             return_dict=True,
@@ -279,10 +293,11 @@ class SmolVLMVLA(PreTrainedModel):
             image_features = self.vlm.model.connector(image_features)
         elif hasattr(self.vlm.model, 'multi_modal_projector'):
             image_features = self.vlm.model.multi_modal_projector(image_features)
+        image_features = image_features.to(dtype=text_dtype)
         
         # ========== Step 2: Get text embeddings ==========
         # Idefics3 (SmolVLM) uses 'text_model' instead of 'language_model'
-        text_embeds = self.vlm.model.text_model.get_input_embeddings()(input_ids)  # [B, L, D]
+        text_embeds = text_model.get_input_embeddings()(input_ids).to(dtype=text_dtype)  # [B, L, D]
         
         # ========== Step 3: Build combined sequence per sample ==========
         # For each sample, concatenate: [image_features_view1, ..., image_features_viewN, text_embeds]
@@ -315,7 +330,7 @@ class SmolVLMVLA(PreTrainedModel):
             max_seq_len = max(max_seq_len, combined.shape[0])
         
         # ========== Step 4: Pad and stack ==========
-        padded_inputs_embeds = torch.zeros(B, max_seq_len, hidden_size, device=device, dtype=dtype)
+        padded_inputs_embeds = torch.zeros(B, max_seq_len, hidden_size, device=device, dtype=text_dtype)
         attention_mask = torch.zeros(B, max_seq_len, device=device, dtype=torch.long)
         
         for b, embeds in enumerate(batch_inputs_embeds):
@@ -325,7 +340,7 @@ class SmolVLMVLA(PreTrainedModel):
         
         # ========== Step 5: Forward through text model (Idefics3/SmolVLM) ==========
         # This fuses visual and linguistic information through the full transformer
-        lm_outputs = self.vlm.model.text_model(
+        lm_outputs = text_model(
             inputs_embeds=padded_inputs_embeds,
             attention_mask=attention_mask,
             output_hidden_states=True,
@@ -357,6 +372,7 @@ class SmolVLMVLA(PreTrainedModel):
         4) Model predicts v_t, compute MSE(v_t, u_t)
         """
         enc = self.forward_vlm_efficient(image_input, image_mask, input_ids)
+        policy_dtype = _module_float_dtype(self.transformer)
 
         B = input_ids.shape[0]
         device = input_ids.device
@@ -382,9 +398,13 @@ class SmolVLMVLA(PreTrainedModel):
             proprio_norm = self.action_space.normalize(proprio)
         else:
             proprio_norm = proprio
+        action_norm = action_norm.to(dtype=policy_dtype)
+        proprio_norm = proprio_norm.to(dtype=policy_dtype)
+        enc["vlm_features"] = enc["vlm_features"].to(dtype=policy_dtype)
         
         # Flow Matching
         noise = torch.randn_like(action_norm)
+        t = t.to(dtype=policy_dtype)
         t_expanded = t.view(-1, 1, 1)
         x_t = t_expanded * noise + (1 - t_expanded) * action_norm
         u_t = noise - action_norm
@@ -457,11 +477,12 @@ class SmolVLMVLA(PreTrainedModel):
         """
         self.eval()
         enc = self.forward_vlm_efficient(image_input, image_mask, input_ids)
+        policy_dtype = _module_float_dtype(self.transformer)
 
         B = input_ids.shape[0]
         D = self.action_space.dim_action
         device = proprio.device
-        dtype = proprio.dtype
+        dtype = policy_dtype
 
         # Normalize proprio
         if hasattr(self.action_space, 'normalize_state'):
@@ -470,6 +491,8 @@ class SmolVLMVLA(PreTrainedModel):
             proprio_norm = self.action_space.normalize(proprio)
         else:
             proprio_norm = proprio
+        proprio_norm = proprio_norm.to(dtype=policy_dtype)
+        enc["vlm_features"] = enc["vlm_features"].to(dtype=policy_dtype)
 
         # Euler integration
         steps = max(1, int(steps))

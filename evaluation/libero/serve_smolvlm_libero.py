@@ -14,6 +14,7 @@ Action format (7D): [delta_xyz(3), delta_axisangle(3), gripper_cmd(1)]
 
 import argparse
 import asyncio
+import contextlib
 import logging
 import os
 import sys
@@ -49,6 +50,9 @@ logger = logging.getLogger(__name__)
 model: Optional[SmolVLMVLA] = None
 processor: Optional[SmolVLMVLAProcessor] = None
 device = "cuda" if torch.cuda.is_available() else "cpu"
+vision_dtype = torch.float32
+policy_dtype = torch.float32
+amp_dtype: torch.dtype | None = torch.bfloat16 if torch.cuda.is_available() else None
 
 # Configuration
 CONFIG = {
@@ -61,13 +65,15 @@ CONFIG = {
 
 def load_model(checkpoint_path: str, norm_stats_path: str = None, smolvlm_model_path: str = None):
     """Load SimVLA model and processor."""
-    global model, processor
+    global model, processor, vision_dtype, policy_dtype
     
     logger.info(f"Loading SimVLA from {checkpoint_path}...")
     
     model = SmolVLMVLA.from_pretrained(checkpoint_path)
     model = model.to(device)
     model.eval()
+    vision_dtype = next(model.vlm.model.vision_model.parameters()).dtype
+    policy_dtype = next(model.transformer.parameters()).dtype
     
     smolvlm_path = smolvlm_model_path or "HuggingFaceTB/SmolVLM-500M-Instruct"
     processor = SmolVLMVLAProcessor.from_pretrained(smolvlm_path)
@@ -82,7 +88,21 @@ def load_model(checkpoint_path: str, norm_stats_path: str = None, smolvlm_model_
     else:
         logger.warning("No norm_stats loaded!")
     
-    logger.info(f"Model loaded! Device: {device}, Image size: {CONFIG['image_size']}x{CONFIG['image_size']}")
+    logger.info(
+        "Model loaded! Device: %s, vision_dtype: %s, policy_dtype: %s, amp_dtype: %s, Image size: %sx%s",
+        device,
+        vision_dtype,
+        policy_dtype,
+        amp_dtype,
+        CONFIG["image_size"],
+        CONFIG["image_size"],
+    )
+
+
+def _autocast_context():
+    if device == "cuda" and amp_dtype is not None:
+        return torch.autocast(device_type="cuda", dtype=amp_dtype)
+    return contextlib.nullcontext()
 
 
 def preprocess_images(image0: np.ndarray, image1: np.ndarray):
@@ -135,7 +155,7 @@ def decode_numpy(obj):
 
 def infer(observation: Dict[str, Any]) -> Dict[str, Any]:
     """Run inference on a single observation."""
-    global model, processor
+    global model, processor, vision_dtype, policy_dtype, amp_dtype
     
     try:
         # Extract observation fields
@@ -174,7 +194,7 @@ def infer(observation: Dict[str, Any]) -> Dict[str, Any]:
         proprio_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
         
         # Inference
-        with torch.no_grad():
+        with torch.no_grad(), _autocast_context():
             actions = model.generate_actions(
                 input_ids=lang['input_ids'],
                 image_input=images,
@@ -272,8 +292,17 @@ def main():
                         help="SmolVLM model path or HuggingFace repo")
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--mixed_precision", type=str, default="bf16", choices=["no", "fp16", "bf16"],
+                        help="Autocast precision for inference. 'bf16' matches training scripts.")
     
     args = parser.parse_args()
+    global amp_dtype
+    if args.mixed_precision == "no":
+        amp_dtype = None
+    elif args.mixed_precision == "fp16":
+        amp_dtype = torch.float16
+    else:
+        amp_dtype = torch.bfloat16
     
     if not HAS_MSGPACK:
         logger.warning("msgpack_numpy not installed! Install with: pip install msgpack-numpy")
