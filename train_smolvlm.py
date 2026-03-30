@@ -311,6 +311,7 @@ def update_group_lrs(optim, step, args):
 # ============================================================
 def main(args):
     output_dir = Path(args.output_dir)
+    train_camera_mode = args.camera_mode if args.dataset_backend == "lerobot_hf" else "dual"
     
     # WandB setup
     wandb_api_key = os.environ.get("WANDB_API_KEY") or args.wandb_api_key
@@ -484,6 +485,7 @@ def main(args):
         logger.info(f"  action_mode: {args.action_mode}")
         logger.info(f"  num_actions: {args.num_actions}")
         logger.info(f"  use_adaln: {args.use_adaln}")
+        logger.info(f"  camera_mode: {train_camera_mode}")
         
         config = SmolVLMVLAConfig(
             smolvlm_model_path=args.smolvlm_model_path,
@@ -494,6 +496,7 @@ def main(args):
             num_actions=args.num_actions,
             use_adaln=args.use_adaln,
             image_size=args.image_size,
+            camera_mode=train_camera_mode,
             latent_aux_enabled=args.latent_aux_enabled,
             latent_num_tokens=latent_num_tokens if args.latent_aux_enabled else 4,
             latent_token_dim=latent_token_dim if args.latent_aux_enabled else 32,
@@ -502,6 +505,8 @@ def main(args):
         
         if action_space_kwargs:
             model.action_space = build_action_space(args.action_mode, **action_space_kwargs)
+
+    model.config.camera_mode = train_camera_mode
     
     # Build processor
     processor = SmolVLMVLAProcessor.from_pretrained(args.smolvlm_model_path)

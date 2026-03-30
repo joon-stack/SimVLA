@@ -53,6 +53,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 vision_dtype = torch.float32
 policy_dtype = torch.float32
 amp_dtype: torch.dtype | None = torch.bfloat16 if torch.cuda.is_available() else None
+camera_mode = "dual"
 
 # Configuration
 CONFIG = {
@@ -63,9 +64,14 @@ CONFIG = {
 }
 
 
-def load_model(checkpoint_path: str, norm_stats_path: str = None, smolvlm_model_path: str = None):
+def load_model(
+    checkpoint_path: str,
+    norm_stats_path: str = None,
+    smolvlm_model_path: str = None,
+    requested_camera_mode: str = "auto",
+):
     """Load SimVLA model and processor."""
-    global model, processor, vision_dtype, policy_dtype
+    global model, processor, vision_dtype, policy_dtype, camera_mode
     
     logger.info(f"Loading SimVLA from {checkpoint_path}...")
     
@@ -74,6 +80,11 @@ def load_model(checkpoint_path: str, norm_stats_path: str = None, smolvlm_model_
     model.eval()
     vision_dtype = next(model.vlm.model.vision_model.parameters()).dtype
     policy_dtype = next(model.transformer.parameters()).dtype
+    config_camera_mode = str(getattr(model.config, "camera_mode", "")).strip().lower()
+    if requested_camera_mode == "auto":
+        camera_mode = config_camera_mode if config_camera_mode in {"single", "dual"} else "dual"
+    else:
+        camera_mode = requested_camera_mode
     
     smolvlm_path = smolvlm_model_path or "HuggingFaceTB/SmolVLM-500M-Instruct"
     processor = SmolVLMVLAProcessor.from_pretrained(smolvlm_path)
@@ -97,6 +108,7 @@ def load_model(checkpoint_path: str, norm_stats_path: str = None, smolvlm_model_
         CONFIG["image_size"],
         CONFIG["image_size"],
     )
+    logger.info("Evaluation camera_mode: %s (config=%s)", camera_mode, config_camera_mode or "missing")
 
 
 def _autocast_context():
@@ -105,7 +117,7 @@ def _autocast_context():
     return contextlib.nullcontext()
 
 
-def preprocess_images(image0: np.ndarray, image1: np.ndarray):
+def preprocess_images(image0: np.ndarray, image1: np.ndarray | None, active_camera_mode: str):
     """Preprocess images to model input format."""
     image_size = CONFIG["image_size"]
     
@@ -116,16 +128,26 @@ def preprocess_images(image0: np.ndarray, image1: np.ndarray):
     ])
     
     img0 = Image.fromarray(image0.astype(np.uint8))
-    img1 = Image.fromarray(image1.astype(np.uint8))
-    
     img0_t = transform(img0)
-    img1_t = transform(img1)
-    
-    # Pad to 3 views (model processes all views together)
     padding = torch.zeros_like(img0_t)
+
+    if active_camera_mode == "single":
+        images = torch.stack([img0_t, padding, padding.clone()], dim=0)
+        image_mask = torch.tensor([[True, False, False]])
+        return images.unsqueeze(0), image_mask
+
+    if image1 is None:
+        images = torch.stack([img0_t, padding, padding.clone()], dim=0)
+        image_mask = torch.tensor([[True, False, False]])
+        return images.unsqueeze(0), image_mask
+
+    img1 = Image.fromarray(image1.astype(np.uint8))
+    img1_t = transform(img1)
+
+    # Pad to 3 views (model processes all views together)
     images = torch.stack([img0_t, img1_t, padding], dim=0)
     image_mask = torch.tensor([[True, True, False]])
-    
+
     return images.unsqueeze(0), image_mask
 
 
@@ -155,7 +177,7 @@ def decode_numpy(obj):
 
 def infer(observation: Dict[str, Any]) -> Dict[str, Any]:
     """Run inference on a single observation."""
-    global model, processor, vision_dtype, policy_dtype, amp_dtype
+    global model, processor, vision_dtype, policy_dtype, amp_dtype, camera_mode
     
     try:
         # Extract observation fields
@@ -172,7 +194,7 @@ def infer(observation: Dict[str, Any]) -> Dict[str, Any]:
         # Ensure numpy arrays
         if not isinstance(image0, np.ndarray):
             image0 = np.array(image0, dtype=np.uint8)
-        if not isinstance(image1, np.ndarray):
+        if image1 is not None and not isinstance(image1, np.ndarray):
             image1 = np.array(image1, dtype=np.uint8)
         if not isinstance(state, np.ndarray):
             state = np.array(state, dtype=np.float32)
@@ -182,7 +204,7 @@ def infer(observation: Dict[str, Any]) -> Dict[str, Any]:
         state = state[:8]
         
         # Preprocess images
-        images, image_mask = preprocess_images(image0, image1)
+        images, image_mask = preprocess_images(image0, image1, camera_mode)
         images = images.to(device)
         image_mask = image_mask.to(device)
         
@@ -294,6 +316,8 @@ def main():
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--mixed_precision", type=str, default="bf16", choices=["no", "fp16", "bf16"],
                         help="Autocast precision for inference. 'bf16' matches training scripts.")
+    parser.add_argument("--camera_mode", type=str, default="auto", choices=["auto", "single", "dual"],
+                        help="Camera views to use for eval. 'auto' reads checkpoint config when available.")
     
     args = parser.parse_args()
     global amp_dtype
@@ -307,7 +331,7 @@ def main():
     if not HAS_MSGPACK:
         logger.warning("msgpack_numpy not installed! Install with: pip install msgpack-numpy")
     
-    load_model(args.checkpoint, args.norm_stats, args.smolvlm_model)
+    load_model(args.checkpoint, args.norm_stats, args.smolvlm_model, args.camera_mode)
     
     logger.info(f"Starting SimVLA server on {args.host}:{args.port}")
     logger.info(f"  Image size: {CONFIG['image_size']}x{CONFIG['image_size']}")

@@ -55,6 +55,7 @@ class SmolVLMVLAConfig(PretrainedConfig):
         # === Image settings ===
         image_size: int = 384,  # Can be 384 or 512
         num_views: int = 3,  # Number of camera views
+        camera_mode: str = "dual",
 
         **kwargs,
     ):
@@ -85,6 +86,7 @@ class SmolVLMVLAConfig(PretrainedConfig):
         # Image settings
         self.image_size = image_size
         self.num_views = num_views
+        self.camera_mode = camera_mode
 
         # Initialize base HF config attributes
         super().__init__(**kwargs)
