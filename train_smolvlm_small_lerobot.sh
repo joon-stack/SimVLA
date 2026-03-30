@@ -1,22 +1,18 @@
 #!/bin/bash
 # SimVLA Training Script for LeRobot LIBERO (Small Model)
-
+export WANDB_API_KEY=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
+export WANDB_PROJECT=simvla-libero
+export WANDB_MODE=online
 set -e
 
-BATCH_SIZE=${1:-128}
+BATCH_SIZE=${1:-64}
 LEARNING_COEF=${2:-0.1}
-OUTPUT_DIR=${3:-./runs/simvla_libero_small_lerobot}
+OUTPUT_DIR=${3:-./runs/simvla_libero_small_lerobot/dual}
 RESUME_CKPT=${4:-""}
 TASK_SUITE_NAME=${5:-""}
 CAMERA_MODE=${6:-dual}
-GRAD_ACCUM_STEPS=${7:-2}
+GRAD_ACCUM_STEPS=${7:-4}
 
-LATENT_AUX_ENABLED=${SIMVLA_LATENT_AUX_ENABLED:-false}
-LATENT_AUX_WEIGHT=${SIMVLA_LATENT_AUX_WEIGHT:-1.0}
-LATENT_TEACHER_REPO_ROOT=${SIMVLA_LATENT_TEACHER_REPO_ROOT:-""}
-LATENT_TEACHER_CONFIG=${SIMVLA_LATENT_TEACHER_CONFIG:-""}
-LATENT_TEACHER_CHECKPOINT=${SIMVLA_LATENT_TEACHER_CHECKPOINT:-""}
-LATENT_TEACHER_FUTURE_OFFSET=${SIMVLA_LATENT_TEACHER_FUTURE_OFFSET:-""}
 echo "Training parameters:"
 echo "   batch_size: $BATCH_SIZE"
 echo "   learning_coef: $LEARNING_COEF"
@@ -44,7 +40,7 @@ NUM_ACTIONS=10
 ITERS=200000
 WARMUP_STEPS=0
 FREEZE_STEPS=1000
-SAVE_INTERVAL=10000
+SAVE_INTERVAL=5000
 LOG_INTERVAL=20
 NUM_WORKERS=4
 MAX_GRAD_NORM=1.0
@@ -89,16 +85,6 @@ if [ "${USE_ADALN}" = true ]; then
     ARGS="${ARGS} --use_adaln"
 fi
 
-if [ "${LATENT_AUX_ENABLED}" = true ]; then
-    ARGS="${ARGS} --latent_aux_enabled --latent_aux_weight ${LATENT_AUX_WEIGHT}"
-    ARGS="${ARGS} --latent_teacher_repo_root ${LATENT_TEACHER_REPO_ROOT}"
-    ARGS="${ARGS} --latent_teacher_config ${LATENT_TEACHER_CONFIG}"
-    ARGS="${ARGS} --latent_teacher_checkpoint ${LATENT_TEACHER_CHECKPOINT}"
-    if [ -n "${LATENT_TEACHER_FUTURE_OFFSET}" ]; then
-        ARGS="${ARGS} --latent_teacher_future_offset ${LATENT_TEACHER_FUTURE_OFFSET}"
-    fi
-fi
-
 if [ -n "${RESUME_CKPT}" ]; then
     ARGS="${ARGS} --models ${RESUME_CKPT} --resume"
     echo "Resuming from ${RESUME_CKPT}"
@@ -116,13 +102,6 @@ echo "num_processes: ${NUM_PROCESSES}"
 echo "grad_accumulation_steps: ${GRAD_ACCUM_STEPS}"
 echo "effective_global_batch_size: ${EFFECTIVE_GLOBAL_BATCH_SIZE}"
 echo "mixed_precision: ${MIXED_PRECISION}"
-if [ "${LATENT_AUX_ENABLED}" = true ]; then
-    echo "latent_aux_enabled: true"
-    echo "latent_aux_weight: ${LATENT_AUX_WEIGHT}"
-    echo "latent_teacher_repo_root: ${LATENT_TEACHER_REPO_ROOT}"
-    echo "latent_teacher_config: ${LATENT_TEACHER_CONFIG}"
-    echo "latent_teacher_checkpoint: ${LATENT_TEACHER_CHECKPOINT}"
-fi
 echo "============================================================"
 
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
