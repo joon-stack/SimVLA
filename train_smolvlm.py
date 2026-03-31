@@ -380,6 +380,10 @@ def main(args):
     logger.info(f"Args: {args}")
     logger.info(f"Using SmolVLM backbone: {args.smolvlm_model_path}")
     logger.info(f"Image size: {args.image_size}x{args.image_size}")
+    logger.info(
+        "DinoLAM latent auxiliary: %s",
+        "ENABLED" if args.latent_aux_enabled else "DISABLED",
+    )
 
     if args.dataset_backend == "libero_hdf5" and not args.train_metas_path:
         raise ValueError("--train_metas_path is required when --dataset_backend=libero_hdf5.")
@@ -442,6 +446,17 @@ def main(args):
             f"image_hw={latent_teacher.image_hw}, "
             f"latent_shape=[{latent_num_tokens}, {latent_token_dim}]"
         )
+        logger.info(
+            "DinoLAM latent auxiliary config: "
+            f"weight={args.latent_aux_weight}, "
+            f"future_offset={args.latent_teacher_future_offset if args.latent_teacher_future_offset is not None else 'auto'}, "
+            f"teacher_image_size={latent_teacher_image_size}, "
+            f"repo_root={args.latent_teacher_repo_root}, "
+            f"config={args.latent_teacher_config}, "
+            f"checkpoint={args.latent_teacher_checkpoint}"
+        )
+    else:
+        logger.info("DinoLAM teacher not loaded because --latent_aux_enabled is false.")
 
     # Load model
     from models.configuration_smolvlm_vla import SmolVLMVLAConfig
@@ -623,9 +638,13 @@ def main(args):
             if accelerator.is_main_process:
                 dt = (time.time() - t0) / args.log_interval
                 t0 = time.time()
+                latent_aux_suffix = ""
+                if "latent_aux_loss" in logs:
+                    latent_aux_suffix = f" latent_aux={logs['latent_aux_loss']:.4f}"
                 logger.info(
                     f"[{global_step}/{args.iters}] "
                     f"loss={logs['loss_total']:.4f} "
+                    f"{latent_aux_suffix}"
                     f"lr_core={logs['lr_transformer_core']:.2e} "
                     f"lr_action={logs['lr_action_heads']:.2e} "
                     f"lr_vlm={logs['lr_vlm']:.2e} ({dt:.2f}s/it)"
