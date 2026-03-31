@@ -246,7 +246,7 @@ class LeRobotLiberoDataReader(IterableDataset):
             [
                 transforms.Resize(
                     (self.latent_teacher_image_size, self.latent_teacher_image_size),
-                    interpolation=InterpolationMode.BICUBIC,
+                    interpolation=InterpolationMode.BILINEAR,
                     antialias=True,
                 ),
                 transforms.ToTensor(),
