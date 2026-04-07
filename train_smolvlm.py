@@ -37,7 +37,6 @@ from datasets import (
     resolve_lerobot_libero_norm_stats_path,
 )
 from models.dinolam_teacher import DinoLAMTeacher
-from models.latent_aux_head import LatentAuxHead
 from models.modeling_smolvlm_vla import SmolVLMVLA
 from models.processing_smolvlm_vla import SmolVLMVLAProcessor
 
@@ -154,19 +153,32 @@ def get_args_parser():
     parser.add_argument("--norm_stats_path", type=str, default=None,
                         help="Path to normalization statistics JSON file")
 
-    # DinoLAM latent auxiliary supervision
+    # DinoLAM latent supervision
+    parser.add_argument("--latent_mode", type=str, default="disabled",
+                        choices=["disabled", "aux_only", "sequential_fm"],
+                        help="Latent supervision/generation mode")
     parser.add_argument("--latent_aux_enabled", action="store_true", default=False,
-                        help="Enable DinoLAM latent auxiliary supervision")
+                        help="Deprecated flag equivalent to --latent_mode aux_only")
     parser.add_argument("--latent_aux_weight", type=float, default=1.0,
-                        help="Weight for DinoLAM latent auxiliary loss")
+                        help="Deprecated alias for latent loss weight")
+    parser.add_argument("--latent_loss_weight", type=float, default=None,
+                        help="Weight for latent loss in aux_only/sequential_fm modes")
+    parser.add_argument("--latent_stride_k", type=int, default=0,
+                        help="Coarse segment stride for sequential_fm latent targets")
+    parser.add_argument("--latent_sample_steps", type=int, default=10,
+                        help="Euler steps used to sample predicted latent memory")
     parser.add_argument("--latent_teacher_repo_root", type=str, default=None,
                         help="Path to the local latent_action repo root")
     parser.add_argument("--latent_teacher_config", type=str, default=None,
                         help="Resolved DinoLAM run config path")
     parser.add_argument("--latent_teacher_checkpoint", type=str, default=None,
                         help="Stage1 DinoLAM checkpoint path")
+    parser.add_argument("--latent_teacher_target", type=str, default="z_t_tokens_raw",
+                        help="Teacher latent key to read from DinoLAM outputs")
+    parser.add_argument("--latent_teacher_obs_key", type=str, default=None,
+                        help="Optional teacher observation key override")
     parser.add_argument("--latent_teacher_future_offset", type=int, default=None,
-                        help="Future offset used for DinoLAM teacher targets")
+                        help="Future offset used for aux_only teacher targets")
     parser.add_argument("--latent_teacher_image_size", type=int, default=0,
                         help="Optional resize for teacher images; <=0 infers from teacher config")
     
@@ -207,42 +219,53 @@ def set_seed(seed: int):
     cudnn.benchmark = True
 
 
-def ensure_model_has_latent_head(model: SmolVLMVLA, latent_num_tokens: int, latent_token_dim: int):
-    """Attach a latent auxiliary head to a loaded checkpoint when needed."""
-    current_enabled = bool(getattr(model, "latent_aux_enabled", False))
-    current_num_tokens = int(getattr(model, "latent_num_tokens", 0))
-    current_token_dim = int(getattr(model, "latent_token_dim", 0))
-    if (
-        current_enabled
-        and current_num_tokens == int(latent_num_tokens)
-        and current_token_dim == int(latent_token_dim)
-        and getattr(model, "latent_head", None) is not None
-    ):
-        return model
+def resolve_requested_latent_mode(args) -> str:
+    latent_mode = str(getattr(args, "latent_mode", "disabled") or "disabled").strip().lower()
+    if latent_mode == "disabled" and bool(getattr(args, "latent_aux_enabled", False)):
+        latent_mode = "aux_only"
+    if latent_mode not in {"disabled", "aux_only", "sequential_fm"}:
+        raise ValueError(f"Unsupported latent_mode={latent_mode!r}.")
+    return latent_mode
 
-    model.latent_aux_enabled = True
-    model.latent_num_tokens = int(latent_num_tokens)
-    model.latent_token_dim = int(latent_token_dim)
-    model.config.latent_aux_enabled = True
-    model.config.latent_num_tokens = int(latent_num_tokens)
-    model.config.latent_token_dim = int(latent_token_dim)
-    model.latent_head = LatentAuxHead(
-        hidden_size=model.transformer.hidden_size,
-        num_tokens=int(latent_num_tokens),
-        token_dim=int(latent_token_dim),
+
+def configure_model_latent_mode(
+    model: SmolVLMVLA,
+    *,
+    latent_mode: str,
+    latent_num_tokens: int,
+    latent_token_dim: int,
+    latent_stride_k: int,
+    latent_loss_weight: float,
+    latent_sample_steps: int,
+):
+    model.configure_latent_mode(
+        latent_mode=latent_mode,
+        latent_num_tokens=latent_num_tokens,
+        latent_token_dim=latent_token_dim,
+        latent_stride_k=latent_stride_k,
+        latent_loss_weight=latent_loss_weight,
+        latent_sample_steps=latent_sample_steps,
     )
     return model
+
+
+def _collect_output_head_params(module: torch.nn.Module | None) -> list[torch.nn.Parameter]:
+    if module is None:
+        return []
+    params: list[torch.nn.Parameter] = []
+    for attr in ("sequence_encoder", "sequence_decoder", "final_layer"):
+        child = getattr(module, attr, None)
+        if child is not None:
+            params.extend(list(child.parameters()))
+    return params
 
 
 def build_optimizer(model: SmolVLMVLA, lr: float, weight_decay: float, betas=(0.9, 0.95), lr_coef_vlm=1.0):
     """Build optimizer with separate param groups."""
     vlm_params = list(model.vlm.parameters())
-    
-    # Get action output params based on mode
-    if hasattr(model.transformer, 'final_layer'):
-        action_params = list(model.transformer.final_layer.parameters()) + list(model.transformer.action_encoder.parameters())
-    else:
-        action_params = list(model.transformer.action_decoder.parameters()) + list(model.transformer.action_encoder.parameters())
+
+    action_params = _collect_output_head_params(model.transformer)
+    action_params += _collect_output_head_params(getattr(model, "latent_transformer", None))
     if getattr(model, "latent_head", None) is not None:
         action_params += list(model.latent_head.parameters())
 
@@ -312,6 +335,9 @@ def update_group_lrs(optim, step, args):
 def main(args):
     output_dir = Path(args.output_dir)
     train_camera_mode = args.camera_mode if args.dataset_backend == "lerobot_hf" else "dual"
+    args.latent_mode = resolve_requested_latent_mode(args)
+    if args.latent_loss_weight is None:
+        args.latent_loss_weight = float(args.latent_aux_weight)
     
     # WandB setup
     wandb_api_key = os.environ.get("WANDB_API_KEY") or args.wandb_api_key
@@ -356,8 +382,12 @@ def main(args):
         "hidden_size": args.hidden_size,
         "depth": args.depth,
         "use_adaln": args.use_adaln,
-        "latent_aux_enabled": args.latent_aux_enabled,
-        "latent_aux_weight": args.latent_aux_weight,
+        "latent_mode": args.latent_mode,
+        "latent_aux_enabled": args.latent_mode == "aux_only",
+        "latent_loss_weight": args.latent_loss_weight,
+        "latent_stride_k": args.latent_stride_k,
+        "latent_sample_steps": args.latent_sample_steps,
+        "latent_teacher_target": args.latent_teacher_target,
         "latent_teacher_repo_root": args.latent_teacher_repo_root,
         "latent_teacher_config": args.latent_teacher_config,
         "latent_teacher_checkpoint": args.latent_teacher_checkpoint,
@@ -381,8 +411,8 @@ def main(args):
     logger.info(f"Using SmolVLM backbone: {args.smolvlm_model_path}")
     logger.info(f"Image size: {args.image_size}x{args.image_size}")
     logger.info(
-        "DinoLAM latent auxiliary: %s",
-        "ENABLED" if args.latent_aux_enabled else "DISABLED",
+        "DinoLAM latent mode: %s",
+        args.latent_mode.upper(),
     )
 
     if args.dataset_backend == "libero_hdf5" and not args.train_metas_path:
@@ -410,7 +440,7 @@ def main(args):
     latent_num_tokens = 0
     latent_token_dim = 0
     latent_teacher_image_size = int(args.latent_teacher_image_size)
-    if args.latent_aux_enabled:
+    if args.latent_mode != "disabled":
         if args.dataset_backend != "lerobot_hf":
             raise ValueError(
                 "DinoLAM latent auxiliary supervision currently requires --dataset_backend lerobot_hf."
@@ -423,7 +453,7 @@ def main(args):
         missing_args = [name for name, value in required_args.items() if not value]
         if missing_args:
             raise ValueError(
-                "latent_aux_enabled requires the following arguments: "
+                f"latent_mode={args.latent_mode!r} requires the following arguments: "
                 + ", ".join(missing_args)
             )
         latent_teacher = DinoLAMTeacher(
@@ -447,16 +477,20 @@ def main(args):
             f"latent_shape=[{latent_num_tokens}, {latent_token_dim}]"
         )
         logger.info(
-            "DinoLAM latent auxiliary config: "
-            f"weight={args.latent_aux_weight}, "
-            f"future_offset={args.latent_teacher_future_offset if args.latent_teacher_future_offset is not None else 'auto'}, "
+            "DinoLAM latent config: "
+            f"mode={args.latent_mode}, "
+            f"weight={args.latent_loss_weight}, "
+            f"future_offset={args.latent_teacher_future_offset if args.latent_mode == 'aux_only' else 'n/a'}, "
+            f"stride_k={args.latent_stride_k if args.latent_mode == 'sequential_fm' else 'n/a'}, "
+            f"sample_steps={args.latent_sample_steps}, "
+            f"target={args.latent_teacher_target}, "
             f"teacher_image_size={latent_teacher_image_size}, "
             f"repo_root={args.latent_teacher_repo_root}, "
             f"config={args.latent_teacher_config}, "
             f"checkpoint={args.latent_teacher_checkpoint}"
         )
     else:
-        logger.info("DinoLAM teacher not loaded because --latent_aux_enabled is false.")
+        logger.info("DinoLAM teacher not loaded because latent_mode is disabled.")
 
     # Load model
     from models.configuration_smolvlm_vla import SmolVLMVLAConfig
@@ -488,12 +522,20 @@ def main(args):
         model_use_adaln = getattr(model, 'use_adaln', False)
         if args.use_adaln != model_use_adaln:
             logger.warning(f"⚠️ Cannot change use_adaln when loading from checkpoint")
-        if args.latent_aux_enabled:
-            ensure_model_has_latent_head(model, latent_num_tokens, latent_token_dim)
-            logger.info(
-                "Attached DinoLAM latent auxiliary head to loaded checkpoint: "
-                f"num_tokens={latent_num_tokens}, token_dim={latent_token_dim}"
-            )
+        configure_model_latent_mode(
+            model,
+            latent_mode=args.latent_mode,
+            latent_num_tokens=latent_num_tokens if args.latent_mode != "disabled" else model.latent_num_tokens,
+            latent_token_dim=latent_token_dim if args.latent_mode != "disabled" else model.latent_token_dim,
+            latent_stride_k=args.latent_stride_k,
+            latent_loss_weight=args.latent_loss_weight,
+            latent_sample_steps=args.latent_sample_steps,
+        )
+        logger.info(
+            "Configured latent mode on loaded checkpoint: "
+            f"mode={args.latent_mode}, num_tokens={model.latent_num_tokens}, "
+            f"token_dim={model.latent_token_dim}, latent_memory_steps={model.config.latent_memory_steps}"
+        )
     else:
         logger.info(f"Initializing SmolVLM-VLA from config")
         logger.info(f"  smolvlm_model_path: {args.smolvlm_model_path}")
@@ -512,9 +554,15 @@ def main(args):
             use_adaln=args.use_adaln,
             image_size=args.image_size,
             camera_mode=train_camera_mode,
-            latent_aux_enabled=args.latent_aux_enabled,
-            latent_num_tokens=latent_num_tokens if args.latent_aux_enabled else 4,
-            latent_token_dim=latent_token_dim if args.latent_aux_enabled else 32,
+            latent_mode=args.latent_mode,
+            latent_aux_enabled=args.latent_mode == "aux_only",
+            latent_loss_weight=args.latent_loss_weight,
+            latent_stride_k=args.latent_stride_k,
+            latent_sample_steps=args.latent_sample_steps,
+            latent_teacher_target=args.latent_teacher_target,
+            latent_teacher_obs_key=args.latent_teacher_obs_key,
+            latent_num_tokens=latent_num_tokens if args.latent_mode != "disabled" else 4,
+            latent_token_dim=latent_token_dim if args.latent_mode != "disabled" else 32,
         )
         model = SmolVLMVLA(config)
         
@@ -537,9 +585,11 @@ def main(args):
             image_size=args.image_size,
             camera_mode=args.camera_mode,
             task_suite_name=args.task_suite_name,
-            emit_latent_teacher_fields=args.latent_aux_enabled,
+            emit_latent_teacher_fields=args.latent_mode != "disabled",
+            latent_mode=args.latent_mode,
             latent_teacher_future_offset=args.latent_teacher_future_offset,
-            latent_teacher_image_size=latent_teacher_image_size if args.latent_aux_enabled else 224,
+            latent_stride_k=args.latent_stride_k,
+            latent_teacher_image_size=latent_teacher_image_size if args.latent_mode != "disabled" else 224,
         )
     else:
         train_dataloader = create_smolvlm_dataloader(
@@ -588,9 +638,9 @@ def main(args):
 
     optim.zero_grad()
     for batch in train_dataloader:
-        latent_obs_image = batch.pop("latent_obs_image", None)
-        latent_future_obs_image = batch.pop("latent_future_obs_image", None)
-        batch.pop("latent_teacher_future_offset", None)
+        latent_current_image = batch.pop("latent_current_image", None)
+        latent_boundary_images = batch.pop("latent_boundary_images", None)
+        latent_boundary_valid = batch.pop("latent_boundary_valid", None)
 
         # Encode language
         lang = processor.encode_language(batch["language_instruction"])
@@ -599,14 +649,21 @@ def main(args):
         inputs = {k: v.to(accelerator.device, non_blocking=True) for k, v in inputs.items()}
 
         if latent_teacher is not None:
-            if latent_obs_image is None or latent_future_obs_image is None:
+            if latent_current_image is None or latent_boundary_images is None:
                 raise RuntimeError(
-                    "latent_aux_enabled is set but the dataloader did not return teacher image pairs."
+                    "Latent teacher is enabled but the dataloader did not return teacher boundary images."
                 )
-            inputs["latent_target_tokens"] = latent_teacher.predict_z_t_tokens(
-                latent_obs_image,
-                latent_future_obs_image,
-            ).to(accelerator.device)
+            teacher_latents, teacher_mask = latent_teacher.predict_segment_latents(
+                latent_current_image,
+                latent_boundary_images,
+                boundary_valid=latent_boundary_valid,
+                target_key=args.latent_teacher_target,
+            )
+            if args.latent_mode == "aux_only":
+                inputs["latent_target_tokens"] = teacher_latents.to(accelerator.device)
+            elif args.latent_mode == "sequential_fm":
+                inputs["latent_target_memory"] = teacher_latents.to(accelerator.device)
+                inputs["latent_target_mask"] = teacher_mask.to(accelerator.device)
 
         with accelerator.accumulate(model):
             # Update LR in optimizer-step units.
@@ -614,9 +671,7 @@ def main(args):
 
             # Forward
             loss_dict: Dict[str, torch.Tensor] = model(**inputs)
-            loss = loss_dict["velocity_loss"]
-            if "latent_aux_loss" in loss_dict:
-                loss = loss + (args.latent_aux_weight * loss_dict["latent_aux_loss"])
+            loss = loss_dict.get("loss_total", loss_dict["velocity_loss"])
 
             # Backward / optimize
             accelerator.backward(loss)
@@ -638,13 +693,15 @@ def main(args):
             if accelerator.is_main_process:
                 dt = (time.time() - t0) / args.log_interval
                 t0 = time.time()
-                latent_aux_suffix = ""
-                if "latent_aux_loss" in logs:
-                    latent_aux_suffix = f" latent_aux={logs['latent_aux_loss']:.4f}"
+                latent_suffix = ""
+                if "loss_latent" in logs:
+                    latent_suffix = f" latent={logs['loss_latent']:.4f}"
+                elif "latent_aux_loss" in logs:
+                    latent_suffix = f" latent_aux={logs['latent_aux_loss']:.4f}"
                 logger.info(
                     f"[{global_step}/{args.iters}] "
                     f"loss={logs['loss_total']:.4f} "
-                    f"{latent_aux_suffix}"
+                    f"{latent_suffix}"
                     f"lr_core={logs['lr_transformer_core']:.2e} "
                     f"lr_action={logs['lr_action_heads']:.2e} "
                     f"lr_vlm={logs['lr_vlm']:.2e} ({dt:.2f}s/it)"

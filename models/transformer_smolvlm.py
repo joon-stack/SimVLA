@@ -1,11 +1,5 @@
 """
-SmolVLM Action Transformer
-
-Action Transformer specifically designed for SmolVLM-VLA.
-Key difference from the original transformer:
-  - No aux_visual_inputs: all views are processed together by SmolVLM
-  - VLM outputs a single unified feature for all views
-  - Simpler architecture: x = torch.cat([x, self.vlm_proj(vlm_features)], dim=1)
+SmolVLM sequence transformer blocks used by the SimVLA flow-matching heads.
 """
 
 from __future__ import annotations
@@ -19,10 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# ------------------------------- Small utils ----------------------------------
-
 def _to_2tuple(x) -> Tuple:
-    """Minimal replacement for timm.layers.to_2tuple."""
     if isinstance(x, Iterable) and not isinstance(x, (str, bytes)):
         t = tuple(x)
         return (t[0], t[1]) if len(t) >= 2 else (t[0], t[0])
@@ -30,15 +21,10 @@ def _to_2tuple(x) -> Tuple:
 
 
 def _has_sdp_attention() -> bool:
-    """Check if we can use PyTorch fused scaled_dot_product_attention."""
     return hasattr(F, "scaled_dot_product_attention")
 
 
-# ---------------------------------- MLP --------------------------------------
-
 class Mlp(nn.Module):
-    """MLP used in ViT-style blocks."""
-
     def __init__(
         self,
         in_features: int,
@@ -73,11 +59,7 @@ class Mlp(nn.Module):
         return x
 
 
-# -------------------------------- Attention ----------------------------------
-
 class Attention(nn.Module):
-    """Multi-Head Self-Attention with optional fused SDPA fallback."""
-
     fused_attn: Final[bool]
 
     def __init__(
@@ -116,7 +98,9 @@ class Attention(nn.Module):
 
         if self.fused_attn:
             x = F.scaled_dot_product_attention(
-                q, k, v,
+                q,
+                k,
+                v,
                 dropout_p=self.attn_drop.p if self.training else 0.0,
             )
         else:
@@ -132,10 +116,7 @@ class Attention(nn.Module):
         return x
 
 
-# ------------------------------- Utilities -----------------------------------
-
 def basic_init(module: nn.Module) -> None:
-    """Apply basic initialization to Linear layers."""
     if isinstance(module, nn.Linear):
         nn.init.xavier_uniform_(module.weight)
         if module.bias is not None:
@@ -143,7 +124,6 @@ def basic_init(module: nn.Module) -> None:
 
 
 def timestep_embedding(t: torch.Tensor, dim: int, max_period: int = 100) -> torch.Tensor:
-    """Create sinusoidal timestep embeddings."""
     half = dim // 2
     freqs = torch.exp(
         -math.log(max_period)
@@ -157,12 +137,14 @@ def timestep_embedding(t: torch.Tensor, dim: int, max_period: int = 100) -> torc
     return embedding
 
 
-# ------------------------------- Core Layers ----------------------------------
-
 class TransformerBlock(nn.Module):
-    """Standard Transformer block (pre-LN)."""
-
-    def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float = 4.0) -> None:
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        mlp_ratio: float = 4.0,
+        use_cross_attention: bool = False,
+    ) -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size)
         self.norm2 = nn.LayerNorm(hidden_size)
@@ -172,103 +154,378 @@ class TransformerBlock(nn.Module):
             hidden_features=int(hidden_size * mlp_ratio),
             drop=0.1,
         )
+        self.use_cross_attention = bool(use_cross_attention)
+        if self.use_cross_attention:
+            self.norm_cross = nn.LayerNorm(hidden_size)
+            self.cross_attn = nn.MultiheadAttention(
+                hidden_size,
+                num_heads,
+                dropout=0.1,
+                batch_first=True,
+            )
+        else:
+            self.norm_cross = None
+            self.cross_attn = None
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        memory: torch.Tensor | None = None,
+        memory_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         x = x + self.attn(self.norm1(x))
+        if self.cross_attn is not None and memory is not None:
+            attn_out, _ = self.cross_attn(
+                query=self.norm_cross(x),
+                key=memory,
+                value=memory,
+                key_padding_mask=memory_mask,
+                need_weights=False,
+            )
+            x = x + attn_out
         x = x + self.mlp(self.norm2(x))
         return x
 
 
-# ------------------------------- DiT Layers (AdaLN) ----------------------------------
-
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    """AdaLN modulation: x * (1 + scale) + shift"""
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 
 class DiTBlock(nn.Module):
-    """DiT Block with Adaptive Layer Normalization (AdaLN)."""
-
-    def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float = 4.0) -> None:
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        mlp_ratio: float = 4.0,
+        use_cross_attention: bool = False,
+    ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
-        
+
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        
+
         self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, attn_drop=0.1)
         self.mlp = Mlp(
             in_features=hidden_size,
             hidden_features=int(hidden_size * mlp_ratio),
             drop=0.1,
         )
-        
+        self.use_cross_attention = bool(use_cross_attention)
+        if self.use_cross_attention:
+            self.norm_cross = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+            self.cross_attn = nn.MultiheadAttention(
+                hidden_size,
+                num_heads,
+                dropout=0.1,
+                batch_first=True,
+            )
+            out_mult = 9
+        else:
+            self.norm_cross = None
+            self.cross_attn = None
+            out_mult = 6
+
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(hidden_size, 6 * hidden_size, bias=True)
+            nn.Linear(hidden_size, out_mult * hidden_size, bias=True),
         )
-        
+
         nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
         nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
 
-    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        c: torch.Tensor,
+        memory: torch.Tensor | None = None,
+        memory_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         modulation_params = self.adaLN_modulation(c)
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-            modulation_params.chunk(6, dim=-1)
-        )
-        
+        if self.use_cross_attention:
+            (
+                shift_msa,
+                scale_msa,
+                gate_msa,
+                shift_cross,
+                scale_cross,
+                gate_cross,
+                shift_mlp,
+                scale_mlp,
+                gate_mlp,
+            ) = modulation_params.chunk(9, dim=-1)
+        else:
+            (
+                shift_msa,
+                scale_msa,
+                gate_msa,
+                shift_mlp,
+                scale_mlp,
+                gate_mlp,
+            ) = modulation_params.chunk(6, dim=-1)
+            shift_cross = scale_cross = gate_cross = None
+
         x_norm = modulate(self.norm1(x), shift_msa, scale_msa)
         x = x + gate_msa.unsqueeze(1) * self.attn(x_norm)
-        
+
+        if self.cross_attn is not None and memory is not None:
+            x_norm = modulate(self.norm_cross(x), shift_cross, scale_cross)
+            attn_out, _ = self.cross_attn(
+                query=x_norm,
+                key=memory,
+                value=memory,
+                key_padding_mask=memory_mask,
+                need_weights=False,
+            )
+            x = x + gate_cross.unsqueeze(1) * attn_out
+
         x_norm = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = x + gate_mlp.unsqueeze(1) * self.mlp(x_norm)
-        
+
         return x
 
 
 class FinalLayer(nn.Module):
-    """DiT Final Layer with AdaLN."""
-    
     def __init__(self, hidden_size: int, out_dim: int) -> None:
         super().__init__()
         self.norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(hidden_size, 2 * hidden_size, bias=True)
+            nn.Linear(hidden_size, 2 * hidden_size, bias=True),
         )
         self.linear = nn.Linear(hidden_size, out_dim, bias=True)
-        
+
         nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
         nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
         nn.init.constant_(self.linear.weight, 0)
         nn.init.constant_(self.linear.bias, 0)
-    
+
     def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
         shift, scale = self.adaLN_modulation(c).chunk(2, dim=-1)
         x = modulate(self.norm(x), shift, scale)
         return self.linear(x)
 
 
-# --------------------------- Main Model (SmolVLM Version) ---------------------------------------
-
-class SmolVLMActionTransformer(nn.Module):
-    """
-    Flow Matching Transformer for action prediction - SmolVLM Version.
-
-    Key difference from ActionTransformer:
-      - No aux_visual_inputs: SmolVLM processes all views together
-      - Simpler forward: x = torch.cat([x, self.vlm_proj(vlm_features)], dim=1)
-      - Only one visual input stream
-    
-    Supports two modes:
-    - Concat mode (use_adaln=False): Original architecture
-    - AdaLN mode (use_adaln=True): DiT style conditioning
-    """
-
+class SmolVLMFlowTransformer(nn.Module):
     def __init__(
         self,
         hidden_size: int = 768,
-        vlm_hidden_size: int = 576,  # Will be overridden by actual model config
+        vlm_hidden_size: int = 576,
+        depth: int = 12,
+        num_heads: int = 12,
+        mlp_ratio: float = 4.0,
+        dim_input: int = 26,
+        dim_output: int | None = None,
+        dim_propio: int = 21,
+        dim_time: int = 32,
+        max_len_seq: int = 1024,
+        use_adaln: bool = False,
+        use_cross_attention: bool = False,
+        memory_dim: int | None = None,
+    ) -> None:
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.dim_input = dim_input
+        self.dim_output = dim_input if dim_output is None else int(dim_output)
+        self.dim_time = dim_time
+        self.dim_propio = dim_propio
+        self.use_adaln = use_adaln
+        self.use_cross_attention = bool(use_cross_attention)
+        self.memory_dim = int(memory_dim) if memory_dim is not None else None
+
+        if use_adaln:
+            self.blocks = nn.ModuleList(
+                [
+                    DiTBlock(
+                        hidden_size,
+                        num_heads,
+                        mlp_ratio=mlp_ratio,
+                        use_cross_attention=self.use_cross_attention,
+                    )
+                    for _ in range(depth)
+                ]
+            )
+            self.time_proj = nn.Sequential(
+                nn.Linear(hidden_size, hidden_size),
+                nn.SiLU(),
+                nn.Linear(hidden_size, hidden_size),
+            )
+            self.vlm_cond_proj = nn.Linear(vlm_hidden_size, hidden_size)
+            self.proprio_proj = nn.Linear(dim_propio, hidden_size)
+            self.sequence_encoder = nn.Linear(self.dim_input, hidden_size)
+            self.pos_emb = nn.Parameter(torch.zeros(1, max_len_seq, hidden_size), requires_grad=True)
+            nn.init.normal_(self.pos_emb, std=0.02)
+            self.final_layer = FinalLayer(hidden_size, self.dim_output)
+            self.norm = None
+            self.sequence_decoder = None
+            self.vlm_proj = None
+        else:
+            self.blocks = nn.ModuleList(
+                [
+                    TransformerBlock(
+                        hidden_size,
+                        num_heads,
+                        mlp_ratio=mlp_ratio,
+                        use_cross_attention=self.use_cross_attention,
+                    )
+                    for _ in range(depth)
+                ]
+            )
+            self.vlm_proj = nn.Linear(vlm_hidden_size, hidden_size)
+            self.pos_emb = nn.Parameter(torch.zeros(1, max_len_seq, hidden_size), requires_grad=True)
+            nn.init.normal_(self.pos_emb, std=0.02)
+            self.norm = nn.LayerNorm(hidden_size)
+            self.sequence_encoder = nn.Linear(self.dim_input + dim_time + dim_propio, hidden_size)
+            self.sequence_decoder = nn.Linear(hidden_size, self.dim_output)
+            self.final_layer = None
+            self.time_proj = None
+            self.vlm_cond_proj = None
+            self.proprio_proj = None
+
+        if self.use_cross_attention:
+            if self.memory_dim is None:
+                raise ValueError("memory_dim must be set when use_cross_attention=True.")
+            self.memory_proj = nn.Linear(self.memory_dim, hidden_size)
+        else:
+            self.memory_proj = None
+
+        self.apply(basic_init)
+
+    def forward(
+        self,
+        vlm_features: torch.Tensor,
+        sequence_with_noise: torch.Tensor,
+        proprio: torch.Tensor,
+        t: torch.Tensor,
+        memory: torch.Tensor | None = None,
+        memory_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        velocity, _ = self.forward_with_features(
+            vlm_features=vlm_features,
+            sequence_with_noise=sequence_with_noise,
+            proprio=proprio,
+            t=t,
+            memory=memory,
+            memory_mask=memory_mask,
+        )
+        return velocity
+
+    def forward_with_features(
+        self,
+        vlm_features: torch.Tensor,
+        sequence_with_noise: torch.Tensor,
+        proprio: torch.Tensor,
+        t: torch.Tensor,
+        memory: torch.Tensor | None = None,
+        memory_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.use_adaln:
+            return self._forward_adaln(
+                vlm_features=vlm_features,
+                sequence_with_noise=sequence_with_noise,
+                proprio=proprio,
+                t=t,
+                memory=memory,
+                memory_mask=memory_mask,
+            )
+        return self._forward_concat(
+            vlm_features=vlm_features,
+            sequence_with_noise=sequence_with_noise,
+            proprio=proprio,
+            t=t,
+            memory=memory,
+            memory_mask=memory_mask,
+        )
+
+    def _project_memory(
+        self,
+        memory: torch.Tensor | None,
+        memory_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        if memory is None:
+            return None, None
+        if self.memory_proj is None:
+            raise RuntimeError("This transformer was not initialized for cross-attention memory.")
+        if memory.ndim != 3:
+            raise ValueError(f"memory must have shape [B, M, D], got {tuple(memory.shape)}.")
+        projected = self.memory_proj(memory)
+        key_padding_mask = None
+        if memory_mask is not None:
+            if memory_mask.ndim != 2:
+                raise ValueError(
+                    f"memory_mask must have shape [B, M], got {tuple(memory_mask.shape)}."
+                )
+            key_padding_mask = ~memory_mask.bool()
+        return projected, key_padding_mask
+
+    def _forward_concat(
+        self,
+        vlm_features: torch.Tensor,
+        sequence_with_noise: torch.Tensor,
+        proprio: torch.Tensor,
+        t: torch.Tensor,
+        memory: torch.Tensor | None = None,
+        memory_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        B, sequence_len = sequence_with_noise.shape[:2]
+
+        time_emb = timestep_embedding(t, self.dim_time)
+        time_tokens = time_emb.unsqueeze(1).expand(B, sequence_len, self.dim_time)
+        proprio_tokens = proprio.unsqueeze(1).expand(B, sequence_len, proprio.shape[-1])
+
+        seq_tokens = torch.cat([sequence_with_noise, proprio_tokens, time_tokens], dim=-1)
+        x = self.sequence_encoder(seq_tokens)
+        x = torch.cat([x, self.vlm_proj(vlm_features)], dim=1)
+
+        seq_plus_vlm_len = x.shape[1]
+        if seq_plus_vlm_len > self.pos_emb.shape[1]:
+            raise ValueError(
+                f"Sequence length {seq_plus_vlm_len} exceeds max_len_seq={self.pos_emb.shape[1]}."
+            )
+        x = x + self.pos_emb[:, :seq_plus_vlm_len, :]
+
+        projected_memory, key_padding_mask = self._project_memory(memory, memory_mask)
+        for block in self.blocks:
+            x = block(x, memory=projected_memory, memory_mask=key_padding_mask)
+
+        policy_hidden = self.norm(x[:, :sequence_len])
+        velocity = self.sequence_decoder(policy_hidden)
+        return velocity, policy_hidden
+
+    def _forward_adaln(
+        self,
+        vlm_features: torch.Tensor,
+        sequence_with_noise: torch.Tensor,
+        proprio: torch.Tensor,
+        t: torch.Tensor,
+        memory: torch.Tensor | None = None,
+        memory_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        B, sequence_len = sequence_with_noise.shape[:2]
+
+        t_emb = timestep_embedding(t, self.hidden_size)
+        t_emb = self.time_proj(t_emb)
+        vlm_cond = self.vlm_cond_proj(vlm_features.mean(dim=1))
+        proprio_cond = self.proprio_proj(proprio)
+        c = t_emb + vlm_cond + proprio_cond
+
+        x = self.sequence_encoder(sequence_with_noise)
+        x = x + self.pos_emb[:, :sequence_len, :]
+
+        projected_memory, key_padding_mask = self._project_memory(memory, memory_mask)
+        for block in self.blocks:
+            x = block(x, c, memory=projected_memory, memory_mask=key_padding_mask)
+
+        policy_hidden = x
+        velocity = self.final_layer(policy_hidden, c)
+        return velocity, policy_hidden
+
+
+class SmolVLMActionTransformer(SmolVLMFlowTransformer):
+    def __init__(
+        self,
+        hidden_size: int = 768,
+        vlm_hidden_size: int = 576,
         depth: int = 12,
         num_heads: int = 12,
         mlp_ratio: float = 4.0,
@@ -277,200 +534,75 @@ class SmolVLMActionTransformer(nn.Module):
         dim_time: int = 32,
         max_len_seq: int = 1024,
         use_adaln: bool = False,
+        use_cross_attention: bool = False,
+        memory_dim: int | None = None,
     ) -> None:
-        super().__init__()
-        self.hidden_size = hidden_size
+        super().__init__(
+            hidden_size=hidden_size,
+            vlm_hidden_size=vlm_hidden_size,
+            depth=depth,
+            num_heads=num_heads,
+            mlp_ratio=mlp_ratio,
+            dim_input=dim_action,
+            dim_output=dim_action,
+            dim_propio=dim_propio,
+            dim_time=dim_time,
+            max_len_seq=max_len_seq,
+            use_adaln=use_adaln,
+            use_cross_attention=use_cross_attention,
+            memory_dim=memory_dim,
+        )
         self.dim_action = dim_action
-        self.dim_time = dim_time
-        self.dim_propio = dim_propio
-        self.use_adaln = use_adaln
-
-        if use_adaln:
-            # ========== DiT Mode: AdaLN ==========
-            self.blocks = nn.ModuleList(
-                [DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)]
-            )
-            
-            # Condition encoders
-            self.time_proj = nn.Sequential(
-                nn.Linear(hidden_size, hidden_size),
-                nn.SiLU(),
-                nn.Linear(hidden_size, hidden_size),
-            )
-            # VLM pooling projection (no aux_visual needed)
-            self.vlm_cond_proj = nn.Linear(vlm_hidden_size, hidden_size)
-            # Proprio projection
-            self.proprio_proj = nn.Linear(dim_propio, hidden_size)
-            
-            # Action encoder
-            self.action_encoder = nn.Linear(dim_action, hidden_size)
-            
-            # Position encoding
-            self.pos_emb = nn.Parameter(torch.zeros(1, max_len_seq, hidden_size), requires_grad=True)
-            nn.init.normal_(self.pos_emb, std=0.02)
-            
-            # Final layer
-            self.final_layer = FinalLayer(hidden_size, dim_action)
-        else:
-            # ========== Concat Mode: Original architecture ==========
-            self.blocks = nn.ModuleList(
-                [TransformerBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)]
-            )
-
-            # VLM projection only (no aux_visual_proj needed for SmolVLM)
-            self.vlm_proj = nn.Linear(vlm_hidden_size, hidden_size)
-
-            self.pos_emb = nn.Parameter(torch.zeros(1, max_len_seq, hidden_size), requires_grad=True)
-            nn.init.normal_(self.pos_emb, std=0.02)
-
-            self.norm = nn.LayerNorm(hidden_size)
-            
-            # Action encoder/decoder
-            action_input_dim = dim_action + dim_time + dim_propio
-            self.action_encoder = nn.Linear(action_input_dim, hidden_size)
-            self.action_decoder = nn.Linear(hidden_size, dim_action)
-
-        self.apply(basic_init)
 
     def forward(
         self,
-        vlm_features: torch.Tensor,  # [B, T_vlm, D] - unified features from SmolVLM
-        action_with_noise: torch.Tensor,
-        proprio: torch.Tensor,
-        t: torch.Tensor,
+        vlm_features: torch.Tensor,
+        action_with_noise: torch.Tensor | None = None,
+        proprio: torch.Tensor | None = None,
+        t: torch.Tensor | None = None,
+        sequence_with_noise: torch.Tensor | None = None,
+        memory: torch.Tensor | None = None,
+        memory_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """
-        Forward pass for SmolVLM Action Transformer.
-
-        Inputs
-        ------
-        vlm_features : [B, T_vlm, D] - Unified features from SmolVLM (all views processed together)
-        action_with_noise : [B, T_action, dim_action]
-        proprio : [B, dim_proprio]
-        t : [B]
-
-        Returns
-        -------
-        Tensor: Predicted velocity, [B, T_action, dim_action]
-        """
-        velocity, _ = self.forward_with_features(
+        if action_with_noise is None:
+            action_with_noise = sequence_with_noise
+        if action_with_noise is None or proprio is None or t is None:
+            raise ValueError("action_with_noise/sequence_with_noise, proprio, and t are required.")
+        return super().forward(
             vlm_features=vlm_features,
-            action_with_noise=action_with_noise,
+            sequence_with_noise=action_with_noise,
             proprio=proprio,
             t=t,
+            memory=memory,
+            memory_mask=memory_mask,
         )
-        return velocity
 
     def forward_with_features(
         self,
         vlm_features: torch.Tensor,
-        action_with_noise: torch.Tensor,
-        proprio: torch.Tensor,
-        t: torch.Tensor,
+        action_with_noise: torch.Tensor | None = None,
+        proprio: torch.Tensor | None = None,
+        t: torch.Tensor | None = None,
+        sequence_with_noise: torch.Tensor | None = None,
+        memory: torch.Tensor | None = None,
+        memory_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Forward pass that returns both the predicted velocity and the shared
-        policy hidden used immediately before the final action projection.
-
-        Returns
-        -------
-        tuple[Tensor, Tensor]
-            velocity: [B, T_action, dim_action]
-            policy_hidden: [B, T_action, hidden_size]
-        """
-        if self.use_adaln:
-            return self._forward_adaln(vlm_features, action_with_noise, proprio, t)
-        return self._forward_concat(vlm_features, action_with_noise, proprio, t)
-    
-    def _forward_concat(
-        self,
-        vlm_features: torch.Tensor,
-        action_with_noise: torch.Tensor,
-        proprio: torch.Tensor,
-        t: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Concat mode forward pass.
-        
-        Simplified: x = torch.cat([x, self.vlm_proj(vlm_features)], dim=1)
-        No aux_visual_inputs needed.
-        """
-        B, num_actions = action_with_noise.shape[:2]
-
-        # Encode (action + proprio + time) → tokens
-        time_emb = timestep_embedding(t, self.dim_time)
-        time_tokens = time_emb.unsqueeze(1).expand(B, num_actions, self.dim_time)
-        proprio_tokens = proprio.unsqueeze(1).expand(B, num_actions, proprio.shape[-1])
-        
-        action_tokens = torch.cat([action_with_noise, proprio_tokens, time_tokens], dim=-1)
-        x = self.action_encoder(action_tokens)  # [B, T_action, H]
-
-        # Project VLM features and concatenate (no aux_visual needed)
-        x = torch.cat([x, self.vlm_proj(vlm_features)], dim=1)
-
-        # Add positional embeddings
-        seq_len = x.shape[1]
-        if seq_len > self.pos_emb.shape[1]:
-            raise ValueError(
-                f"Sequence length {seq_len} exceeds max_len_seq={self.pos_emb.shape[1]}."
-            )
-        x = x + self.pos_emb[:, :seq_len, :]
-
-        # Transformer backbone
-        for block in self.blocks:
-            x = block(x)
-
-        # Decode only the action segment.
-        policy_hidden = self.norm(x[:, :num_actions])
-        velocity = self.action_decoder(policy_hidden)
-        return velocity, policy_hidden
-    
-    def _forward_adaln(
-        self,
-        vlm_features: torch.Tensor,
-        action_with_noise: torch.Tensor,
-        proprio: torch.Tensor,
-        t: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        DiT/AdaLN mode forward pass.
-        
-        Conditions (time, vlm, proprio) injected via AdaLN.
-        No aux_visual needed for SmolVLM.
-        """
-        B, num_actions = action_with_noise.shape[:2]
-        
-        # ========== 1. Build global condition c ==========
-        # Time embedding
-        t_emb = timestep_embedding(t, self.hidden_size)
-        t_emb = self.time_proj(t_emb)  # [B, H]
-        
-        # VLM condition: Global Average Pooling
-        vlm_cond = self.vlm_cond_proj(vlm_features.mean(dim=1))  # [B, H]
-        
-        # Proprio condition
-        proprio_cond = self.proprio_proj(proprio)  # [B, H]
-        
-        # Fuse all conditions
-        c = t_emb + vlm_cond + proprio_cond  # [B, H]
-        
-        # ========== 2. Encode action sequence ==========
-        x = self.action_encoder(action_with_noise)  # [B, T_action, H]
-        
-        # Add position encoding
-        x = x + self.pos_emb[:, :num_actions, :]
-        
-        # ========== 3. DiT Blocks with AdaLN ==========
-        for block in self.blocks:
-            x = block(x, c)
-        
-        # ========== 4. Final Layer with AdaLN ==========
-        policy_hidden = x
-        velocity = self.final_layer(policy_hidden, c)
-        return velocity, policy_hidden
+        if action_with_noise is None:
+            action_with_noise = sequence_with_noise
+        if action_with_noise is None or proprio is None or t is None:
+            raise ValueError("action_with_noise/sequence_with_noise, proprio, and t are required.")
+        return super().forward_with_features(
+            vlm_features=vlm_features,
+            sequence_with_noise=action_with_noise,
+            proprio=proprio,
+            t=t,
+            memory=memory,
+            memory_mask=memory_mask,
+        )
 
 
 __all__ = [
+    "SmolVLMFlowTransformer",
     "SmolVLMActionTransformer",
     "TransformerBlock",
     "DiTBlock",

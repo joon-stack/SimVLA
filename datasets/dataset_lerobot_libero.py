@@ -141,6 +141,43 @@ def resolve_lerobot_libero_norm_stats_path(dataset_root: str) -> str | None:
     return None
 
 
+def _resolve_latent_mode(
+    *,
+    emit_latent_teacher_fields: bool,
+    latent_mode: str | None,
+) -> str:
+    mode = str(latent_mode or "disabled").strip().lower()
+    if mode == "disabled" and emit_latent_teacher_fields:
+        mode = "aux_only"
+    if mode not in {"disabled", "aux_only", "sequential_fm"}:
+        raise ValueError(f"Unsupported latent_mode={latent_mode!r}.")
+    return mode
+
+
+def _compute_latent_boundary_offsets(
+    *,
+    future_horizon: int,
+    latent_mode: str,
+    latent_teacher_future_offset: int,
+    latent_stride_k: int,
+) -> list[int]:
+    if latent_mode == "disabled":
+        return []
+    if latent_mode == "aux_only":
+        return [int(latent_teacher_future_offset)]
+    stride_k = int(latent_stride_k)
+    if stride_k <= 0:
+        stride_k = int(future_horizon)
+    offsets: list[int] = []
+    current = stride_k
+    while current < future_horizon:
+        offsets.append(int(current))
+        current += stride_k
+    if len(offsets) == 0 or offsets[-1] != int(future_horizon):
+        offsets.append(int(future_horizon))
+    return offsets
+
+
 class LeRobotLiberoDataReader(IterableDataset):
     IMAGE_MEAN = (0.485, 0.456, 0.406)
     IMAGE_STD = (0.229, 0.224, 0.225)
@@ -157,7 +194,9 @@ class LeRobotLiberoDataReader(IterableDataset):
         camera_mode: str = "single",
         task_suite_name: str | None = None,
         emit_latent_teacher_fields: bool = False,
+        latent_mode: str = "disabled",
         latent_teacher_future_offset: int | None = None,
+        latent_stride_k: int = 0,
         latent_teacher_image_size: int = 224,
     ):
         if ds is None or pq is None:
@@ -179,7 +218,11 @@ class LeRobotLiberoDataReader(IterableDataset):
             raise ValueError(
                 f"camera_mode must be 'single' or 'dual', got {self.camera_mode!r}."
             )
-        self.emit_latent_teacher_fields = bool(emit_latent_teacher_fields)
+        self.latent_mode = _resolve_latent_mode(
+            emit_latent_teacher_fields=bool(emit_latent_teacher_fields),
+            latent_mode=latent_mode,
+        )
+        self.emit_latent_teacher_fields = self.latent_mode != "disabled"
         if latent_teacher_future_offset is None:
             latent_teacher_future_offset = self.num_actions
         self.latent_teacher_future_offset = int(latent_teacher_future_offset)
@@ -188,6 +231,7 @@ class LeRobotLiberoDataReader(IterableDataset):
                 "latent_teacher_future_offset must be positive, got "
                 f"{self.latent_teacher_future_offset}."
             )
+        self.latent_stride_k = int(latent_stride_k)
         self.latent_teacher_image_size = int(latent_teacher_image_size)
         if self.latent_teacher_image_size <= 0:
             raise ValueError(
@@ -196,6 +240,13 @@ class LeRobotLiberoDataReader(IterableDataset):
             )
         self.task_suite_name = normalize_libero_task_suite_name(task_suite_name)
         self.task_indices = resolve_libero_task_indices(task_suite_name)
+        self.future_horizon = int(self.num_actions)
+        self.latent_boundary_offsets = _compute_latent_boundary_offsets(
+            future_horizon=self.future_horizon,
+            latent_mode=self.latent_mode,
+            latent_teacher_future_offset=self.latent_teacher_future_offset,
+            latent_stride_k=self.latent_stride_k,
+        )
         self.image_keys = ["observation.images.image"]
         if self.camera_mode == "dual":
             self.image_keys.append("observation.images.image2")
@@ -215,7 +266,8 @@ class LeRobotLiberoDataReader(IterableDataset):
         print(
             "[LeRobot LIBERO] root="
             f"{self.dataset_root}, task_suite={self.task_suite_name or 'all'}, "
-            f"camera_mode={self.camera_mode}, num_episodes={len(self._episodes)}"
+            f"camera_mode={self.camera_mode}, latent_mode={self.latent_mode}, "
+            f"num_episodes={len(self._episodes)}"
         )
 
     def _build_image_transforms(self, training: bool) -> transforms.Compose:
@@ -424,16 +476,31 @@ class LeRobotLiberoDataReader(IterableDataset):
             return None
         return self.latent_teacher_image_transform(image)
 
-    def _build_latent_teacher_image_pair(
+    def _build_latent_teacher_sequence(
         self, rows: list[dict], start_idx: int
-    ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        last_valid_index = len(rows) - 1
-        future_idx = min(start_idx + self.latent_teacher_future_offset, last_valid_index)
-        latent_obs_image = self._build_teacher_image_tensor(rows[start_idx])
-        latent_future_obs_image = self._build_teacher_image_tensor(rows[future_idx])
-        if latent_obs_image is None or latent_future_obs_image is None:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        if len(self.latent_boundary_offsets) == 0:
             return None
-        return latent_obs_image, latent_future_obs_image
+        last_valid_index = len(rows) - 1
+        current_image = self._build_teacher_image_tensor(rows[start_idx])
+        if current_image is None:
+            return None
+        boundary_images: list[torch.Tensor] = []
+        boundary_valid: list[bool] = []
+        for offset in self.latent_boundary_offsets:
+            target_index = start_idx + int(offset)
+            is_valid = target_index <= last_valid_index
+            target_index = min(target_index, last_valid_index)
+            target_image = self._build_teacher_image_tensor(rows[target_index])
+            if target_image is None:
+                return None
+            boundary_images.append(target_image)
+            boundary_valid.append(bool(is_valid))
+        return (
+            current_image,
+            torch.stack(boundary_images, dim=0),
+            torch.tensor(boundary_valid, dtype=torch.bool),
+        )
 
     def _build_future_action_chunk(self, rows: list[dict], start_idx: int) -> torch.Tensor:
         last_valid_index = len(rows) - 1
@@ -467,16 +534,13 @@ class LeRobotLiberoDataReader(IterableDataset):
                 "action": action,
             }
             if self.emit_latent_teacher_fields:
-                teacher_pair = self._build_latent_teacher_image_pair(rows, idx)
-                if teacher_pair is None:
+                teacher_sequence = self._build_latent_teacher_sequence(rows, idx)
+                if teacher_sequence is None:
                     continue
-                latent_obs_image, latent_future_obs_image = teacher_pair
-                sample["latent_obs_image"] = latent_obs_image
-                sample["latent_future_obs_image"] = latent_future_obs_image
-                sample["latent_teacher_future_offset"] = torch.tensor(
-                    self.latent_teacher_future_offset,
-                    dtype=torch.long,
-                )
+                latent_current_image, latent_boundary_images, latent_boundary_valid = teacher_sequence
+                sample["latent_current_image"] = latent_current_image
+                sample["latent_boundary_images"] = latent_boundary_images
+                sample["latent_boundary_valid"] = latent_boundary_valid
             yield sample
 
     def __iter__(self):
@@ -510,7 +574,9 @@ def create_lerobot_libero_dataloader(
     camera_mode: str = "single",
     task_suite_name: str | None = None,
     emit_latent_teacher_fields: bool = False,
+    latent_mode: str = "disabled",
     latent_teacher_future_offset: int | None = None,
+    latent_stride_k: int = 0,
     latent_teacher_image_size: int = 224,
 ):
     def worker_init_fn(worker_id: int):
@@ -538,7 +604,9 @@ def create_lerobot_libero_dataloader(
         camera_mode=camera_mode,
         task_suite_name=task_suite_name,
         emit_latent_teacher_fields=emit_latent_teacher_fields,
+        latent_mode=latent_mode,
         latent_teacher_future_offset=latent_teacher_future_offset,
+        latent_stride_k=latent_stride_k,
         latent_teacher_image_size=latent_teacher_image_size,
     )
     return DataLoader(

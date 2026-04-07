@@ -48,7 +48,13 @@ class SmolVLMVLAConfig(PretrainedConfig):
         use_adaln: bool = False,
 
         # === Latent auxiliary head ===
+        latent_mode: str = "disabled",
         latent_aux_enabled: bool = False,
+        latent_loss_weight: float = 1.0,
+        latent_stride_k: int = 0,
+        latent_sample_steps: int = 10,
+        latent_teacher_target: str = "z_t_tokens_raw",
+        latent_teacher_obs_key: str | None = None,
         latent_num_tokens: int = 4,
         latent_token_dim: int = 32,
         
@@ -79,7 +85,13 @@ class SmolVLMVLAConfig(PretrainedConfig):
         self.use_adaln = use_adaln
 
         # Latent auxiliary settings
+        self.latent_mode = str(latent_mode).strip().lower()
         self.latent_aux_enabled = latent_aux_enabled
+        self.latent_loss_weight = float(latent_loss_weight)
+        self.latent_stride_k = int(latent_stride_k)
+        self.latent_sample_steps = int(latent_sample_steps)
+        self.latent_teacher_target = str(latent_teacher_target)
+        self.latent_teacher_obs_key = latent_teacher_obs_key
         self.latent_num_tokens = latent_num_tokens
         self.latent_token_dim = latent_token_dim
         
@@ -97,3 +109,53 @@ class SmolVLMVLAConfig(PretrainedConfig):
         """
         output = super().to_dict()
         return output
+
+    @property
+    def n_obs_steps(self) -> int:
+        return 1
+
+    @property
+    def future_horizon(self) -> int:
+        return int(self.num_actions)
+
+    @property
+    def latent_boundaries(self) -> list[int]:
+        future_horizon = int(self.future_horizon)
+        if future_horizon <= 0:
+            return [0]
+        if self.latent_mode != "sequential_fm":
+            return [0, future_horizon]
+        stride_k = int(self.latent_stride_k)
+        if stride_k <= 0:
+            stride_k = future_horizon
+        boundaries = [0]
+        offset = stride_k
+        while offset < future_horizon:
+            boundaries.append(int(offset))
+            offset += stride_k
+        if boundaries[-1] != future_horizon:
+            boundaries.append(future_horizon)
+        return boundaries
+
+    @property
+    def latent_boundary_offsets(self) -> list[int]:
+        return [int(v) for v in self.latent_boundaries[1:]]
+
+    @property
+    def n_segment_steps(self) -> int:
+        return max(1, len(self.latent_boundaries) - 1)
+
+    @property
+    def n_latent_steps(self) -> int:
+        return int(self.latent_num_tokens)
+
+    @property
+    def latent_memory_steps(self) -> int:
+        if self.latent_mode == "sequential_fm":
+            return int(self.n_segment_steps * self.latent_num_tokens)
+        return int(self.latent_num_tokens)
+
+    @property
+    def observation_delta_indices(self) -> list[int]:
+        history = list(range(1 - self.n_obs_steps, 1))
+        return history + self.latent_boundary_offsets

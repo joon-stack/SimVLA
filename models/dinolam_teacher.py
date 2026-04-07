@@ -232,7 +232,7 @@ class DinoLAMTeacher(nn.Module):
         if orig_dtype == torch.uint8:
             image = image.div(255.0)
         if self.image_value_range == "minus_one_to_one":
-            return ((image + 1.0) * 0.5).clamp(0.0, 1.0)
+            return image.mul(2.0).sub(1.0).clamp(-1.0, 1.0)
         return image.clamp(0.0, 1.0)
 
     def _resize(self, image: torch.Tensor) -> torch.Tensor:
@@ -301,6 +301,88 @@ class DinoLAMTeacher(nn.Module):
     @torch.inference_mode()
     def predict_z_t_tokens(self, current_image: Any, future_image: Any) -> torch.Tensor:
         return self.forward(current_image, future_image)
+
+    @torch.inference_mode()
+    def predict_segment_latents(
+        self,
+        current_image: Any,
+        boundary_images: Any,
+        *,
+        boundary_valid: torch.Tensor | None = None,
+        target_key: str = "z_t_tokens_raw",
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if boundary_images is None:
+            raise ValueError("boundary_images is required for segment latent prediction.")
+
+        if isinstance(boundary_images, torch.Tensor):
+            boundary_tensor = boundary_images
+        else:
+            boundary_tensor = self._to_tensor(boundary_images)
+        if boundary_tensor.ndim == 4:
+            boundary_tensor = boundary_tensor.unsqueeze(0)
+        if boundary_tensor.ndim != 5:
+            raise ValueError(
+                "boundary_images must have shape [S,C,H,W] or [B,S,C,H,W], got "
+                f"{tuple(boundary_tensor.shape)}."
+            )
+        B, S = boundary_tensor.shape[:2]
+        current = self.preprocess_image(current_image)
+        if current.shape[0] != B:
+            raise ValueError(
+                "Teacher current/boundary batch size mismatch: "
+                f"{current.shape[0]} vs {B}."
+            )
+        flat_boundaries = self.preprocess_image(boundary_tensor.reshape(B * S, *boundary_tensor.shape[2:]))
+        flat_boundaries = flat_boundaries.reshape(B, S, *flat_boundaries.shape[1:])
+
+        all_endpoints = torch.cat([current.unsqueeze(1), flat_boundaries], dim=1)
+        obs_start = all_endpoints[:, :-1].reshape(B * S, *all_endpoints.shape[2:])
+        obs_end = all_endpoints[:, 1:].reshape(B * S, *all_endpoints.shape[2:])
+        obs_start = obs_start.to(self.device)
+        obs_end = obs_end.to(self.device)
+        outputs = self.teacher(
+            obs={self.image_key: obs_start},
+            obs_future={self.image_key: obs_end},
+        )
+        outputs = {
+            key: value.detach() if isinstance(value, torch.Tensor) else value
+            for key, value in outputs.items()
+        }
+
+        resolved_target_key = str(target_key).strip()
+        if resolved_target_key == "auto":
+            if "z_t_tokens_raw" in outputs:
+                resolved_target_key = "z_t_tokens_raw"
+            elif "z_t_tokens" in outputs:
+                resolved_target_key = "z_t_tokens"
+            else:
+                raise KeyError("Teacher forward did not return a token latent target.")
+
+        teacher_latents = outputs.get(resolved_target_key, None)
+        if teacher_latents is None:
+            raise KeyError(f"Teacher forward did not return target {resolved_target_key!r}.")
+        if teacher_latents.ndim != 3:
+            raise ValueError(
+                "Teacher token target must have shape [B*S,Q,Dz], got "
+                f"{tuple(teacher_latents.shape)}."
+            )
+        teacher_latents = teacher_latents.reshape(B, S, teacher_latents.shape[1], teacher_latents.shape[2])
+        teacher_latents = teacher_latents.reshape(B, S * teacher_latents.shape[2], teacher_latents.shape[3])
+
+        if boundary_valid is None:
+            valid_mask = torch.ones(B, S, device=teacher_latents.device, dtype=torch.bool)
+        else:
+            valid_mask = boundary_valid.to(device=teacher_latents.device, dtype=torch.bool)
+            if valid_mask.ndim == 1:
+                valid_mask = valid_mask.unsqueeze(0)
+            if valid_mask.shape != (B, S):
+                raise ValueError(
+                    "boundary_valid must have shape [B,S], got "
+                    f"{tuple(valid_mask.shape)}."
+                )
+        valid_mask = valid_mask.unsqueeze(-1).expand(B, S, self.latent_num_tokens)
+        valid_mask = valid_mask.reshape(B, S * self.latent_num_tokens)
+        return teacher_latents, valid_mask
 
 
 __all__ = [
