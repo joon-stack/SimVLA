@@ -456,7 +456,7 @@ class SmolVLMVLA(PreTrainedModel):
         valid_mask: torch.Tensor | None = None,
         memory: torch.Tensor | None = None,
         memory_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         B = target_sequence.shape[0]
         device = target_sequence.device
         dtype = target_sequence.dtype
@@ -473,7 +473,8 @@ class SmolVLMVLA(PreTrainedModel):
             memory=memory,
             memory_mask=memory_mask,
         )
-        return _masked_mse(v_t, u_t, valid_mask=valid_mask), policy_hidden
+        clean_estimate = x_t - (t_expanded * v_t)
+        return _masked_mse(v_t, u_t, valid_mask=valid_mask), policy_hidden, clean_estimate
 
     @torch.no_grad()
     def _sample_sequence(
@@ -554,7 +555,7 @@ class SmolVLMVLA(PreTrainedModel):
             if latent_target_mask is not None:
                 latent_target_mask = latent_target_mask.to(device=latent_target_memory.device, dtype=torch.bool)
 
-            latent_loss, _ = self._compute_fm_loss(
+            latent_loss, _, predicted_latents = self._compute_fm_loss(
                 transformer=self.latent_transformer,
                 target_sequence=latent_target_memory,
                 proprio=proprio_norm,
@@ -562,24 +563,24 @@ class SmolVLMVLA(PreTrainedModel):
                 valid_mask=latent_target_mask,
             )
 
-            predicted_latents = self._sample_sequence(
-                transformer=self.latent_transformer,
-                sequence_shape=(
-                    input_ids.shape[0],
-                    self.config.latent_memory_steps,
-                    self.latent_token_dim,
-                ),
-                proprio=proprio_norm,
-                vlm_features=vlm_features,
-                steps=self.latent_sample_steps,
-            ).detach()
+            # Keep training cheap: reuse the 1-step denoised latent estimate
+            # instead of running a separate latent sampling loop every step.
+            predicted_latents = predicted_latents.detach()
+            action_memory_mask = None
+            if latent_target_mask is not None:
+                predicted_latents = predicted_latents.masked_fill(
+                    ~latent_target_mask.unsqueeze(-1),
+                    0.0,
+                )
+                action_memory_mask = ~latent_target_mask
 
-            action_loss, _ = self._compute_fm_loss(
+            action_loss, _, _ = self._compute_fm_loss(
                 transformer=self.transformer,
                 target_sequence=action_norm,
                 proprio=proprio_norm,
                 vlm_features=vlm_features,
                 memory=predicted_latents,
+                memory_mask=action_memory_mask,
             )
             total_loss = action_loss + (self.latent_loss_weight * latent_loss)
             info_dtype = action_loss.dtype
@@ -601,7 +602,7 @@ class SmolVLMVLA(PreTrainedModel):
                 ),
             }
 
-        action_loss, policy_hidden = self._compute_fm_loss(
+        action_loss, policy_hidden, _ = self._compute_fm_loss(
             transformer=self.transformer,
             target_sequence=action_norm,
             proprio=proprio_norm,
