@@ -49,6 +49,7 @@ class SmolVLMVLAConfig(PretrainedConfig):
 
         # === Latent auxiliary head ===
         latent_mode: str = "disabled",
+        latent_training_stage: str = "joint",
         latent_aux_enabled: bool = False,
         latent_loss_weight: float = 1.0,
         latent_stride_k: int = 0,
@@ -86,6 +87,7 @@ class SmolVLMVLAConfig(PretrainedConfig):
 
         # Latent auxiliary settings
         self.latent_mode = str(latent_mode).strip().lower()
+        self.latent_training_stage = str(latent_training_stage).strip().lower()
         self.latent_aux_enabled = latent_aux_enabled
         self.latent_loss_weight = float(latent_loss_weight)
         self.latent_stride_k = int(latent_stride_k)

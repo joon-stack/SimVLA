@@ -46,6 +46,16 @@ def _resolve_latent_mode(config: SmolVLMVLAConfig) -> str:
     return latent_mode
 
 
+def _resolve_latent_training_stage(config: SmolVLMVLAConfig, latent_mode: str | None = None) -> str:
+    latent_mode = latent_mode or _resolve_latent_mode(config)
+    stage = str(getattr(config, "latent_training_stage", "joint")).strip().lower()
+    if latent_mode != "sequential_fm":
+        return "joint"
+    if stage not in {"joint", "latent_only", "action_only"}:
+        raise ValueError(f"Unsupported latent_training_stage={stage!r}.")
+    return stage
+
+
 def _masked_mse(
     pred: torch.Tensor,
     target: torch.Tensor,
@@ -157,12 +167,14 @@ class SmolVLMVLA(PreTrainedModel):
         self.latent_mode = "disabled"
         self.latent_enabled = False
         self.latent_aux_enabled = False
+        self.latent_training_stage = "joint"
         self.latent_num_tokens = int(getattr(config, "latent_num_tokens", 4))
         self.latent_token_dim = int(getattr(config, "latent_token_dim", 32))
         self.latent_loss_weight = float(getattr(config, "latent_loss_weight", 1.0))
         self.latent_sample_steps = int(getattr(config, "latent_sample_steps", 10))
         self.configure_latent_mode(
             latent_mode=_resolve_latent_mode(config),
+            latent_training_stage=_resolve_latent_training_stage(config),
             latent_num_tokens=self.latent_num_tokens,
             latent_token_dim=self.latent_token_dim,
             latent_stride_k=int(getattr(config, "latent_stride_k", 0)),
@@ -235,6 +247,7 @@ class SmolVLMVLA(PreTrainedModel):
         self,
         *,
         latent_mode: str,
+        latent_training_stage: str,
         latent_num_tokens: int,
         latent_token_dim: int,
         latent_stride_k: int,
@@ -244,8 +257,17 @@ class SmolVLMVLA(PreTrainedModel):
         latent_mode = str(latent_mode).strip().lower()
         if latent_mode not in {"disabled", "aux_only", "sequential_fm"}:
             raise ValueError(f"Unsupported latent_mode={latent_mode!r}.")
+        latent_training_stage = str(latent_training_stage).strip().lower()
+        if latent_mode == "sequential_fm":
+            if latent_training_stage not in {"joint", "latent_only", "action_only"}:
+                raise ValueError(
+                    f"Unsupported latent_training_stage={latent_training_stage!r}."
+                )
+        else:
+            latent_training_stage = "joint"
 
         self.config.latent_mode = latent_mode
+        self.config.latent_training_stage = latent_training_stage
         self.config.latent_aux_enabled = latent_mode == "aux_only"
         self.config.latent_num_tokens = int(latent_num_tokens)
         self.config.latent_token_dim = int(latent_token_dim)
@@ -256,6 +278,7 @@ class SmolVLMVLA(PreTrainedModel):
         self.latent_mode = latent_mode
         self.latent_enabled = latent_mode != "disabled"
         self.latent_aux_enabled = latent_mode == "aux_only"
+        self.latent_training_stage = latent_training_stage
         self.latent_num_tokens = int(latent_num_tokens)
         self.latent_token_dim = int(latent_token_dim)
         self.latent_loss_weight = float(latent_loss_weight)
@@ -533,55 +556,81 @@ class SmolVLMVLA(PreTrainedModel):
         if self.latent_mode == "sequential_fm":
             if self.latent_transformer is None:
                 raise RuntimeError("latent_mode='sequential_fm' requires latent_transformer.")
-            if latent_target_memory is None:
-                raise RuntimeError("sequential_fm requires latent_target_memory during training.")
-            if latent_target_memory.ndim != 3:
-                raise ValueError(
-                    "latent_target_memory must have shape [B, M, Dz], got "
-                    f"{tuple(latent_target_memory.shape)}."
-                )
-            if latent_target_memory.shape[1] != self.config.latent_memory_steps:
-                raise ValueError(
-                    "latent_target_memory step mismatch: expected "
-                    f"{self.config.latent_memory_steps}, got {latent_target_memory.shape[1]}."
-                )
-            if latent_target_memory.shape[2] != self.latent_token_dim:
-                raise ValueError(
-                    "latent_target_memory dim mismatch: expected "
-                    f"{self.latent_token_dim}, got {latent_target_memory.shape[2]}."
-                )
+            zero_scalar = action_norm.new_zeros(())
 
-            latent_target_memory = latent_target_memory.to(dtype=policy_dtype)
-            if latent_target_mask is not None:
-                latent_target_mask = latent_target_mask.to(device=latent_target_memory.device, dtype=torch.bool)
-
-            latent_loss, _, predicted_latents = self._compute_fm_loss(
-                transformer=self.latent_transformer,
-                target_sequence=latent_target_memory,
-                proprio=proprio_norm,
-                vlm_features=vlm_features,
-                valid_mask=latent_target_mask,
-            )
-
-            # Keep training cheap: reuse the 1-step denoised latent estimate
-            # instead of running a separate latent sampling loop every step.
-            predicted_latents = predicted_latents.detach()
+            predicted_latents = None
             action_memory_mask = None
-            if latent_target_mask is not None:
-                predicted_latents = predicted_latents.masked_fill(
-                    ~latent_target_mask.unsqueeze(-1),
-                    0.0,
-                )
-                action_memory_mask = ~latent_target_mask
 
-            action_loss, _, _ = self._compute_fm_loss(
-                transformer=self.transformer,
-                target_sequence=action_norm,
-                proprio=proprio_norm,
-                vlm_features=vlm_features,
-                memory=predicted_latents,
-                memory_mask=action_memory_mask,
-            )
+            if self.latent_training_stage != "action_only":
+                if latent_target_memory is None:
+                    raise RuntimeError(
+                        "sequential_fm with latent_training_stage != 'action_only' "
+                        "requires latent_target_memory during training."
+                    )
+                if latent_target_memory.ndim != 3:
+                    raise ValueError(
+                        "latent_target_memory must have shape [B, M, Dz], got "
+                        f"{tuple(latent_target_memory.shape)}."
+                    )
+                if latent_target_memory.shape[1] != self.config.latent_memory_steps:
+                    raise ValueError(
+                        "latent_target_memory step mismatch: expected "
+                        f"{self.config.latent_memory_steps}, got {latent_target_memory.shape[1]}."
+                    )
+                if latent_target_memory.shape[2] != self.latent_token_dim:
+                    raise ValueError(
+                        "latent_target_memory dim mismatch: expected "
+                        f"{self.latent_token_dim}, got {latent_target_memory.shape[2]}."
+                    )
+
+                latent_target_memory = latent_target_memory.to(dtype=policy_dtype)
+                if latent_target_mask is not None:
+                    latent_target_mask = latent_target_mask.to(
+                        device=latent_target_memory.device,
+                        dtype=torch.bool,
+                    )
+
+                latent_loss, _, predicted_latents = self._compute_fm_loss(
+                    transformer=self.latent_transformer,
+                    target_sequence=latent_target_memory,
+                    proprio=proprio_norm,
+                    vlm_features=vlm_features,
+                    valid_mask=latent_target_mask,
+                )
+
+                if self.latent_training_stage != "latent_only":
+                    predicted_latents = predicted_latents.detach()
+                    if latent_target_mask is not None:
+                        predicted_latents = predicted_latents.masked_fill(
+                            ~latent_target_mask.unsqueeze(-1),
+                            0.0,
+                        )
+                        action_memory_mask = ~latent_target_mask
+            else:
+                latent_loss = zero_scalar
+                predicted_latents = self._sample_sequence(
+                    transformer=self.latent_transformer,
+                    sequence_shape=(
+                        input_ids.shape[0],
+                        self.config.latent_memory_steps,
+                        self.latent_token_dim,
+                    ),
+                    proprio=proprio_norm,
+                    vlm_features=vlm_features,
+                    steps=self.latent_sample_steps,
+                ).detach()
+
+            if self.latent_training_stage == "latent_only":
+                action_loss = zero_scalar
+            else:
+                action_loss, _, _ = self._compute_fm_loss(
+                    transformer=self.transformer,
+                    target_sequence=action_norm,
+                    proprio=proprio_norm,
+                    vlm_features=vlm_features,
+                    memory=predicted_latents,
+                    memory_mask=action_memory_mask,
+                )
             total_loss = action_loss + (self.latent_loss_weight * latent_loss)
             info_dtype = action_loss.dtype
             info_device = action_loss.device

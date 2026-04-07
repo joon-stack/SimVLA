@@ -26,6 +26,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_actions", type=int, default=10)
     parser.add_argument("--latent_stride_k", type=int, default=4)
     parser.add_argument("--latent_sample_steps", type=int, default=2)
+    parser.add_argument("--latent_training_stage", type=str, default="joint",
+                        choices=["joint", "latent_only", "action_only"])
     parser.add_argument("--camera_mode", type=str, default="dual")
     parser.add_argument("--check_save_reload", action="store_true")
     parser.add_argument("--teacher_repo_root", type=str, default="")
@@ -69,6 +71,7 @@ def main() -> None:
         camera_mode=args.camera_mode,
         num_views=2 if args.camera_mode == "dual" else 1,
         latent_mode="sequential_fm",
+        latent_training_stage=args.latent_training_stage,
         latent_num_tokens=latent_num_tokens,
         latent_token_dim=latent_token_dim,
         latent_stride_k=args.latent_stride_k,
@@ -87,7 +90,7 @@ def main() -> None:
     proprio = torch.randn(1, 8, device=device)
     action = torch.randn(1, args.num_actions, 7, device=device)
 
-    if teacher is not None:
+    if teacher is not None and args.latent_training_stage != "action_only":
         current = torch.rand(1, 3, teacher.image_hw[0], teacher.image_hw[1])
         boundaries = torch.rand(1, config.n_segment_steps, 3, teacher.image_hw[0], teacher.image_hw[1])
         boundary_valid = torch.ones(1, config.n_segment_steps, dtype=torch.bool)
@@ -101,7 +104,7 @@ def main() -> None:
         )
         latent_target_memory = latent_target_memory.to(device)
         latent_target_mask = latent_target_mask.to(device)
-    else:
+    elif args.latent_training_stage != "action_only":
         latent_target_memory = torch.randn(
             1,
             config.latent_memory_steps,
@@ -109,6 +112,9 @@ def main() -> None:
             device=device,
         )
         latent_target_mask = torch.ones(1, config.latent_memory_steps, dtype=torch.bool, device=device)
+    else:
+        latent_target_memory = None
+        latent_target_mask = None
 
     with torch.no_grad():
         outputs = model(
@@ -120,6 +126,7 @@ def main() -> None:
             latent_target_memory=latent_target_memory,
             latent_target_mask=latent_target_mask,
         )
+    print(f"latent_training_stage={args.latent_training_stage}")
     print(f"latent_boundaries={config.latent_boundaries}")
     print(f"latent_memory_steps={config.latent_memory_steps}")
     print(f"forward_keys={sorted(outputs.keys())}")

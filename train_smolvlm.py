@@ -157,6 +157,9 @@ def get_args_parser():
     parser.add_argument("--latent_mode", type=str, default="disabled",
                         choices=["disabled", "aux_only", "sequential_fm"],
                         help="Latent supervision/generation mode")
+    parser.add_argument("--latent_training_stage", type=str, default="joint",
+                        choices=["joint", "latent_only", "action_only"],
+                        help="Training stage for sequential_fm latent/action branches")
     parser.add_argument("--latent_aux_enabled", action="store_true", default=False,
                         help="Deprecated flag equivalent to --latent_mode aux_only")
     parser.add_argument("--latent_aux_weight", type=float, default=1.0,
@@ -228,10 +231,24 @@ def resolve_requested_latent_mode(args) -> str:
     return latent_mode
 
 
+def resolve_requested_latent_training_stage(args) -> str:
+    latent_training_stage = str(
+        getattr(args, "latent_training_stage", "joint") or "joint"
+    ).strip().lower()
+    if getattr(args, "latent_mode", "disabled") != "sequential_fm":
+        return "joint"
+    if latent_training_stage not in {"joint", "latent_only", "action_only"}:
+        raise ValueError(
+            f"Unsupported latent_training_stage={latent_training_stage!r}."
+        )
+    return latent_training_stage
+
+
 def configure_model_latent_mode(
     model: SmolVLMVLA,
     *,
     latent_mode: str,
+    latent_training_stage: str,
     latent_num_tokens: int,
     latent_token_dim: int,
     latent_stride_k: int,
@@ -240,6 +257,7 @@ def configure_model_latent_mode(
 ):
     model.configure_latent_mode(
         latent_mode=latent_mode,
+        latent_training_stage=latent_training_stage,
         latent_num_tokens=latent_num_tokens,
         latent_token_dim=latent_token_dim,
         latent_stride_k=latent_stride_k,
@@ -256,21 +274,46 @@ def _collect_output_head_params(module: torch.nn.Module | None) -> list[torch.nn
     for attr in ("sequence_encoder", "sequence_decoder", "final_layer"):
         child = getattr(module, attr, None)
         if child is not None:
-            params.extend(list(child.parameters()))
+            params.extend([p for p in child.parameters() if p.requires_grad])
     return params
+
+
+def apply_latent_training_stage(model: SmolVLMVLA, *, logger, latent_mode: str, latent_training_stage: str):
+    if latent_mode != "sequential_fm":
+        logger.info("Latent training stage: joint (latent_mode is not sequential_fm)")
+        return model
+
+    stage = str(latent_training_stage).strip().lower()
+    logger.info("Latent training stage: %s", stage)
+    if stage == "joint":
+        return model
+    if stage == "latent_only":
+        model.transformer.requires_grad_(False)
+        logger.info("Froze action transformer for latent_only stage.")
+        return model
+    if stage == "action_only":
+        if model.latent_transformer is None:
+            raise RuntimeError("action_only stage requires a configured latent_transformer.")
+        model.latent_transformer.requires_grad_(False)
+        logger.info("Froze latent transformer for action_only stage.")
+        return model
+    raise ValueError(f"Unsupported latent_training_stage={latent_training_stage!r}.")
 
 
 def build_optimizer(model: SmolVLMVLA, lr: float, weight_decay: float, betas=(0.9, 0.95), lr_coef_vlm=1.0):
     """Build optimizer with separate param groups."""
-    vlm_params = list(model.vlm.parameters())
+    vlm_params = [p for p in model.vlm.parameters() if p.requires_grad]
 
     action_params = _collect_output_head_params(model.transformer)
     action_params += _collect_output_head_params(getattr(model, "latent_transformer", None))
     if getattr(model, "latent_head", None) is not None:
-        action_params += list(model.latent_head.parameters())
+        action_params += [p for p in model.latent_head.parameters() if p.requires_grad]
 
     exclude = set(map(id, vlm_params + action_params))
-    transformer_core_params = [p for p in model.parameters() if id(p) not in exclude]
+    transformer_core_params = [
+        p for p in model.parameters()
+        if id(p) not in exclude and p.requires_grad
+    ]
     
     param_groups = [
         {"name": "vlm", "params": vlm_params, "lr": 0.0, "weight_decay": weight_decay},
@@ -336,6 +379,7 @@ def main(args):
     output_dir = Path(args.output_dir)
     train_camera_mode = args.camera_mode if args.dataset_backend == "lerobot_hf" else "dual"
     args.latent_mode = resolve_requested_latent_mode(args)
+    args.latent_training_stage = resolve_requested_latent_training_stage(args)
     if args.latent_loss_weight is None:
         args.latent_loss_weight = float(args.latent_aux_weight)
     
@@ -384,6 +428,7 @@ def main(args):
         "use_adaln": args.use_adaln,
         "latent_mode": args.latent_mode,
         "latent_aux_enabled": args.latent_mode == "aux_only",
+        "latent_training_stage": args.latent_training_stage,
         "latent_loss_weight": args.latent_loss_weight,
         "latent_stride_k": args.latent_stride_k,
         "latent_sample_steps": args.latent_sample_steps,
@@ -414,6 +459,10 @@ def main(args):
         "DinoLAM latent mode: %s",
         args.latent_mode.upper(),
     )
+    logger.info(
+        "DinoLAM latent training stage: %s",
+        args.latent_training_stage.upper(),
+    )
 
     if args.dataset_backend == "libero_hdf5" and not args.train_metas_path:
         raise ValueError("--train_metas_path is required when --dataset_backend=libero_hdf5.")
@@ -440,7 +489,15 @@ def main(args):
     latent_num_tokens = 0
     latent_token_dim = 0
     latent_teacher_image_size = int(args.latent_teacher_image_size)
-    if args.latent_mode != "disabled":
+    requires_teacher = (
+        args.latent_mode != "disabled"
+        and not (
+            args.latent_mode == "sequential_fm"
+            and args.latent_training_stage == "action_only"
+        )
+    )
+
+    if requires_teacher:
         if args.dataset_backend != "lerobot_hf":
             raise ValueError(
                 "DinoLAM latent auxiliary supervision currently requires --dataset_backend lerobot_hf."
@@ -479,6 +536,7 @@ def main(args):
         logger.info(
             "DinoLAM latent config: "
             f"mode={args.latent_mode}, "
+            f"training_stage={args.latent_training_stage}, "
             f"weight={args.latent_loss_weight}, "
             f"future_offset={args.latent_teacher_future_offset if args.latent_mode == 'aux_only' else 'n/a'}, "
             f"stride_k={args.latent_stride_k if args.latent_mode == 'sequential_fm' else 'n/a'}, "
@@ -490,7 +548,11 @@ def main(args):
             f"checkpoint={args.latent_teacher_checkpoint}"
         )
     else:
-        logger.info("DinoLAM teacher not loaded because latent_mode is disabled.")
+        logger.info(
+            "DinoLAM teacher not loaded because latent_mode=%s with training_stage=%s does not require it.",
+            args.latent_mode,
+            args.latent_training_stage,
+        )
 
     # Load model
     from models.configuration_smolvlm_vla import SmolVLMVLAConfig
@@ -525,18 +587,25 @@ def main(args):
         configure_model_latent_mode(
             model,
             latent_mode=args.latent_mode,
-            latent_num_tokens=latent_num_tokens if args.latent_mode != "disabled" else model.latent_num_tokens,
-            latent_token_dim=latent_token_dim if args.latent_mode != "disabled" else model.latent_token_dim,
+            latent_training_stage=args.latent_training_stage,
+            latent_num_tokens=latent_num_tokens if latent_num_tokens > 0 else model.latent_num_tokens,
+            latent_token_dim=latent_token_dim if latent_token_dim > 0 else model.latent_token_dim,
             latent_stride_k=args.latent_stride_k,
             latent_loss_weight=args.latent_loss_weight,
             latent_sample_steps=args.latent_sample_steps,
         )
         logger.info(
             "Configured latent mode on loaded checkpoint: "
-            f"mode={args.latent_mode}, num_tokens={model.latent_num_tokens}, "
+            f"mode={args.latent_mode}, training_stage={args.latent_training_stage}, "
+            f"num_tokens={model.latent_num_tokens}, "
             f"token_dim={model.latent_token_dim}, latent_memory_steps={model.config.latent_memory_steps}"
         )
     else:
+        if args.latent_mode == "sequential_fm" and args.latent_training_stage == "action_only":
+            raise ValueError(
+                "latent_training_stage='action_only' requires --models pointing to a pretrained "
+                "sequential_fm checkpoint with a learned latent branch."
+            )
         logger.info(f"Initializing SmolVLM-VLA from config")
         logger.info(f"  smolvlm_model_path: {args.smolvlm_model_path}")
         logger.info(f"  action_mode: {args.action_mode}")
@@ -555,14 +624,15 @@ def main(args):
             image_size=args.image_size,
             camera_mode=train_camera_mode,
             latent_mode=args.latent_mode,
+            latent_training_stage=args.latent_training_stage,
             latent_aux_enabled=args.latent_mode == "aux_only",
             latent_loss_weight=args.latent_loss_weight,
             latent_stride_k=args.latent_stride_k,
             latent_sample_steps=args.latent_sample_steps,
             latent_teacher_target=args.latent_teacher_target,
             latent_teacher_obs_key=args.latent_teacher_obs_key,
-            latent_num_tokens=latent_num_tokens if args.latent_mode != "disabled" else 4,
-            latent_token_dim=latent_token_dim if args.latent_mode != "disabled" else 32,
+            latent_num_tokens=latent_num_tokens if latent_num_tokens > 0 else 4,
+            latent_token_dim=latent_token_dim if latent_token_dim > 0 else 32,
         )
         model = SmolVLMVLA(config)
         
@@ -570,6 +640,12 @@ def main(args):
             model.action_space = build_action_space(args.action_mode, **action_space_kwargs)
 
     model.config.camera_mode = train_camera_mode
+    apply_latent_training_stage(
+        model,
+        logger=logger,
+        latent_mode=args.latent_mode,
+        latent_training_stage=args.latent_training_stage,
+    )
     
     # Build processor
     processor = SmolVLMVLAProcessor.from_pretrained(args.smolvlm_model_path)
@@ -585,11 +661,11 @@ def main(args):
             image_size=args.image_size,
             camera_mode=args.camera_mode,
             task_suite_name=args.task_suite_name,
-            emit_latent_teacher_fields=args.latent_mode != "disabled",
+            emit_latent_teacher_fields=requires_teacher,
             latent_mode=args.latent_mode,
             latent_teacher_future_offset=args.latent_teacher_future_offset,
             latent_stride_k=args.latent_stride_k,
-            latent_teacher_image_size=latent_teacher_image_size if args.latent_mode != "disabled" else 224,
+            latent_teacher_image_size=latent_teacher_image_size if requires_teacher else 224,
         )
     else:
         train_dataloader = create_smolvlm_dataloader(

@@ -8,6 +8,7 @@ if [ -n "${SIMVLA_WANDB_API_KEY:-}" ]; then
 fi
 
 export SIMVLA_LATENT_MODE="${SIMVLA_LATENT_MODE:-sequential_fm}"
+export SIMVLA_LATENT_TRAINING_STAGE="${SIMVLA_LATENT_TRAINING_STAGE:-joint}"
 export SIMVLA_LATENT_LOSS_WEIGHT="${SIMVLA_LATENT_LOSS_WEIGHT:-1.0}"
 export SIMVLA_LATENT_STRIDE_K="${SIMVLA_LATENT_STRIDE_K:-4}"
 export SIMVLA_LATENT_SAMPLE_STEPS="${SIMVLA_LATENT_SAMPLE_STEPS:-10}"
@@ -20,6 +21,7 @@ RESUME_CKPT=${4:-""}
 TASK_SUITE_NAME=${5:-""}
 CAMERA_MODE=${6:-dual}
 GRAD_ACCUM_STEPS=${7:-4}
+INIT_CKPT=${SIMVLA_INIT_CKPT:-""}
 
 echo "Training parameters:"
 echo "   batch_size: $BATCH_SIZE"
@@ -97,22 +99,36 @@ if [ "${USE_ADALN}" = true ]; then
     ARGS="${ARGS} --use_adaln"
 fi
 
+if [ -n "${INIT_CKPT}" ] && [ -n "${RESUME_CKPT}" ]; then
+    echo "SIMVLA_INIT_CKPT and RESUME_CKPT cannot both be set."
+    exit 1
+fi
+
+if [ -n "${INIT_CKPT}" ]; then
+    ARGS="${ARGS} --models ${INIT_CKPT}"
+    echo "Initializing from ${INIT_CKPT}"
+fi
+
 if [ -n "${RESUME_CKPT}" ]; then
     ARGS="${ARGS} --models ${RESUME_CKPT} --resume"
     echo "Resuming from ${RESUME_CKPT}"
 fi
 
 if [ "${SIMVLA_LATENT_MODE}" != "disabled" ]; then
-    : "${SIMVLA_LATENT_TEACHER_REPO_ROOT:?SIMVLA_LATENT_TEACHER_REPO_ROOT is required}"
-    : "${SIMVLA_LATENT_TEACHER_CONFIG:?SIMVLA_LATENT_TEACHER_CONFIG is required}"
-    : "${SIMVLA_LATENT_TEACHER_CHECKPOINT:?SIMVLA_LATENT_TEACHER_CHECKPOINT is required}"
-
     ARGS="${ARGS} --latent_mode ${SIMVLA_LATENT_MODE}"
+    ARGS="${ARGS} --latent_training_stage ${SIMVLA_LATENT_TRAINING_STAGE}"
     ARGS="${ARGS} --latent_loss_weight ${SIMVLA_LATENT_LOSS_WEIGHT}"
-    ARGS="${ARGS} --latent_teacher_repo_root ${SIMVLA_LATENT_TEACHER_REPO_ROOT}"
-    ARGS="${ARGS} --latent_teacher_config ${SIMVLA_LATENT_TEACHER_CONFIG}"
-    ARGS="${ARGS} --latent_teacher_checkpoint ${SIMVLA_LATENT_TEACHER_CHECKPOINT}"
-    ARGS="${ARGS} --latent_teacher_target ${SIMVLA_LATENT_TEACHER_TARGET}"
+
+    if ! { [ "${SIMVLA_LATENT_MODE}" = "sequential_fm" ] && [ "${SIMVLA_LATENT_TRAINING_STAGE}" = "action_only" ]; }; then
+        : "${SIMVLA_LATENT_TEACHER_REPO_ROOT:?SIMVLA_LATENT_TEACHER_REPO_ROOT is required}"
+        : "${SIMVLA_LATENT_TEACHER_CONFIG:?SIMVLA_LATENT_TEACHER_CONFIG is required}"
+        : "${SIMVLA_LATENT_TEACHER_CHECKPOINT:?SIMVLA_LATENT_TEACHER_CHECKPOINT is required}"
+
+        ARGS="${ARGS} --latent_teacher_repo_root ${SIMVLA_LATENT_TEACHER_REPO_ROOT}"
+        ARGS="${ARGS} --latent_teacher_config ${SIMVLA_LATENT_TEACHER_CONFIG}"
+        ARGS="${ARGS} --latent_teacher_checkpoint ${SIMVLA_LATENT_TEACHER_CHECKPOINT}"
+        ARGS="${ARGS} --latent_teacher_target ${SIMVLA_LATENT_TEACHER_TARGET}"
+    fi
 
     if [ "${SIMVLA_LATENT_MODE}" = "sequential_fm" ]; then
         ARGS="${ARGS} --latent_stride_k ${SIMVLA_LATENT_STRIDE_K}"
@@ -135,6 +151,7 @@ echo "grad_accumulation_steps: ${GRAD_ACCUM_STEPS}"
 echo "effective_global_batch_size: ${EFFECTIVE_GLOBAL_BATCH_SIZE}"
 echo "mixed_precision: ${MIXED_PRECISION}"
 echo "latent_mode: ${SIMVLA_LATENT_MODE}"
+echo "latent_training_stage: ${SIMVLA_LATENT_TRAINING_STAGE}"
 if [ "${SIMVLA_LATENT_MODE}" = "sequential_fm" ]; then
     echo "latent_stride_k: ${SIMVLA_LATENT_STRIDE_K}"
     echo "latent_sample_steps: ${SIMVLA_LATENT_SAMPLE_STEPS}"
