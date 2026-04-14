@@ -323,6 +323,30 @@ def build_optimizer(model: SmolVLMVLA, lr: float, weight_decay: float, betas=(0.
     return AdamW(param_groups, betas=betas)
 
 
+def _optimizer_state_path(checkpoint_dir: str | os.PathLike[str]) -> str:
+    return os.path.join(checkpoint_dir, "optim.pt")
+
+
+def maybe_load_optimizer_state(optim, checkpoint_dir: str | os.PathLike[str], *, logger) -> bool:
+    optim_path = _optimizer_state_path(checkpoint_dir)
+    if not os.path.exists(optim_path):
+        logger.warning(
+            "Resume requested but optimizer state was not found at %s. "
+            "Continuing with freshly initialized optimizer.",
+            optim_path,
+        )
+        return False
+
+    optimizer_state = torch.load(optim_path, map_location="cpu")
+    optim.load_state_dict(optimizer_state)
+    logger.info("Loaded optimizer state from: %s", optim_path)
+    return True
+
+
+def save_optimizer_state(optim, checkpoint_dir: str | os.PathLike[str]) -> None:
+    torch.save(optim.state_dict(), _optimizer_state_path(checkpoint_dir))
+
+
 def set_group_lr(optim: torch.optim.Optimizer, name: str, lr: float):
     for g in optim.param_groups:
         if g["name"] == name:
@@ -688,6 +712,9 @@ def main(args):
     )
     model, optim = accelerator.prepare(model, optim)
 
+    if args.resume and load_path and os.path.isdir(load_path):
+        maybe_load_optimizer_state(optim, load_path, logger=logger)
+
     # Training loop
     model.train()
     
@@ -790,6 +817,7 @@ def main(args):
                 save_dir = os.path.join(output_dir, f"ckpt-{global_step}")
                 accelerator.print(f"💾 Saving model to {save_dir}")
                 accelerator.unwrap_model(model).save_pretrained(save_dir, safe_serialization=True)
+                save_optimizer_state(optim, save_dir)
                 with open(os.path.join(save_dir, "state.json"), "w") as f:
                     json.dump({"global_step": global_step}, f)
 
